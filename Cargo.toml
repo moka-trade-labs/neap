@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/neap", "services/*"]
+# Own workspace roots with their own deps and wasm profile: the real-runtime
+# sandbox tests and the mock USDC contract. Build them as in crates/README.md.
+exclude = ["crates/neap/sandbox", "crates/neap/sandbox/mock-ft"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# Profiles only apply at the workspace root. `release` is the contract's wasm
+# profile (small, panic = abort, overflow checks on); the engine's old
+# `release` (lto = "fat", opt-level 3) is dropped.
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
+
+# Solana build profile from the engine (phase 2).
+[profile.sbf]
+inherits = "release"
+panic = "abort"

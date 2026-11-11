@@ -1,0 +1,27 @@
+[package]
+name = "neap"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Neap: NEAR perps contract around the Percolator v16 risk engine (pool-to-peer markets)"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+percolator = { path = "../engine" }
+bytemuck = { version = "1.23", default-features = false, features = ["derive"] }
+near-sdk = { version = "5.30", optional = true }
+
+[dev-dependencies]
+near-sdk = { version = "5.30", features = ["unit-testing"] }
+
+[features]
+default = ["contract"]
+# The near-sdk contract layer. `cargo kani --no-default-features` verifies the
+# pure policy/ledger layer without pulling near-sdk into the model.
+contract = ["dep:near-sdk"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

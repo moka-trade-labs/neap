@@ -1,0 +1,10 @@
+target/
+node_modules/
+.env
+.env.*
+*.wasm
+!res/*.wasm
+.near-credentials/
+neardev/
+.DS_Store
+target-wasm/
