@@ -138,4 +138,22 @@ Steps 1.7 (conditional orders), 1.8 (fees), 1.9 (admin roles) implemented. 48 te
 - Tests: `admin_set_mode_tightens_only`, `admin_cannot_loosen_mode`, `pauser_can_tighten_mode`,
   `stranger_cannot_set_mode`, `admin_methods_do_not_change_balances` (invariant 6).
 
+### claim_fees fix (2026-11-12)
+- `claim_fees` now calls `exchange::withdraw_insurance_surplus` on the engine group before moving
+  tokens to the wallet. This keeps `custody_vaults == engine_vault` (invariant 1).
+- New `exchange::withdraw_insurance_surplus(g, amount)` → tries full amount, falls back to available
+  surplus if insurance was used for bad debt. Returns actual withdrawn amount.
+- If surplus is exhausted, the ledger is unchanged and the caller can retry later.
+
+### Sandbox tests (2026-11-12)
+- `sandbox/mock-ref-pool/`: minimal Ref Finance pool mock (returns `get_pool` JSON).
+- `sandbox_flow_and_gas`: updated to use `request_order` + `execute_order` (two-step).
+  Full flow: deposit → open 10 → oracle +1% → crank → close → convert PnL → withdraw.
+  Bob profits, custody invariant holds.
+- `sandbox_refresh_price_near_pool` (1.3 + 1.4): creates a `NearPool` market via
+  `ft_transfer_call(CreateMarket{...})`, calls `refresh_price` (cross-contract to mock),
+  verifies `on_price_read` writes correct `price_e6=5_000_000` and `seq=1`,
+  then `activate_market` succeeds.
+- Both tests pass. 48 unit tests + 2 sandbox tests all green.
+
 Next: 1.10 keeper (off-chain), 1.11 indexer + API, 1.12 security gate + mainnet deploy.

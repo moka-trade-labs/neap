@@ -524,3 +524,36 @@ pub fn deposit_insurance(g: &mut Group, amount: u128) -> ExResult<()> {
     }
     Ok(())
 }
+
+/// Withdraw from the engine's unbudgeted insurance surplus. This is how
+/// accrued trading fees leave the engine vault to become claimable tokens.
+/// Returns the amount actually withdrawn (may be less than requested if the
+/// surplus is insufficient).
+pub fn withdraw_insurance_surplus(g: &mut Group, amount: u128) -> ExResult<u128> {
+    if amount == 0 {
+        return Ok(0);
+    }
+    // Try the full amount first; if the surplus is too small, query the
+    // available surplus and withdraw that instead.
+    match g.view().withdraw_insurance_surplus_not_atomic(amount) {
+        Ok(()) => Ok(amount),
+        Err(_) => {
+            // The insurance may have less surplus than the fee ledger claims.
+            // Withdraw whatever is available.
+            let insurance = g.header.insurance.get();
+            let reserved = g
+                .header
+                .source_insurance_credit_reserved_total_atoms
+                .get()
+                + g.header.insurance_domain_budget_remaining_total.get();
+            let available = insurance.saturating_sub(reserved);
+            if available == 0 {
+                return Ok(0);
+            }
+            let withdraw = amount.min(available);
+            g.view()
+                .withdraw_insurance_surplus_not_atomic(withdraw)?;
+            Ok(withdraw)
+        }
+    }
+}

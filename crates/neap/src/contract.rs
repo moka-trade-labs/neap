@@ -35,8 +35,8 @@ const EVENT_VERSION: &str = "1.0.0";
 
 const GAS_FT_TRANSFER: Gas = Gas::from_tgas(10);
 const GAS_WITHDRAW_CALLBACK: Gas = Gas::from_tgas(10);
-const GAS_GET_POOL: Gas = Gas::from_tgas(5);
-const GAS_ON_PRICE_READ: Gas = Gas::from_tgas(20);
+const GAS_GET_POOL: Gas = Gas::from_tgas(10);
+const GAS_ON_PRICE_READ: Gas = Gas::from_tgas(50);
 /// Allowed oracle clock skew into the future.
 const ORACLE_MAX_FUTURE_NS: u64 = 2_000_000_000;
 /// Maximum order lifetime in blocks (~30 s at 600 ms/block).
@@ -406,7 +406,6 @@ impl Neap {
                     return PromiseOrValue::Value(amount);
                 }
                 require!(spread_bps <= policy::MAX_SPREAD_BPS, "spread too wide");
-                let start = env::storage_usage();
                 let id = self.markets.len();
                 let gid = self.group_id(id);
                 // Initial price of 0 — it will be set by the first observation.
@@ -454,16 +453,18 @@ impl Neap {
                 let mut c = self.custody();
                 c.external_in(amount.0)
                     .unwrap_or_else(|| env::panic_str("custody overflow"));
-                self.wallets
-                    .entry(who.clone())
-                    .or_insert(0);
+                // Ensure the lister has a wallet (may already from register).
+                if !self.wallets.contains_key(&who) {
+                    self.wallets.insert(who.clone(), 0);
+                }
                 // Bond goes to the lister's wallet, then immediately into the
                 // vault via LP seed (or held for refund). For now, hold in wallet.
                 let bal = self.wallets.get(&who).copied().unwrap_or(0);
                 self.wallets.insert(who.clone(), bal + amount.0);
                 self.set_custody(c);
                 self.flush();
-                self.charge_storage(start);
+                // Storage cost is covered by the bond (no attached NEAR in ft_on_transfer).
+                // The lister's bond is the economic guarantee for both listing and storage.
                 emit(
                     "market_created",
                     serde_json::json!({
@@ -1204,7 +1205,8 @@ impl Neap {
     // ─────────────────────── 1.8: fees ───────────────────────
 
     /// Claim accrued fees for the lister or protocol. The tokens come from the
-    /// engine's insurance surplus (already deposited into the vault).
+    /// engine's insurance surplus: trading fees flow into the engine vault as
+    /// insurance; this method withdraws the surplus to fund the payout.
     #[payable]
     pub fn claim_fees(&mut self, market: u32, payee: Payee) -> U128 {
         assert_one_yocto();
@@ -1229,22 +1231,35 @@ impl Neap {
         if accrued == 0 {
             return U128(0);
         }
-        self.fee_ledgers.insert(key, 0);
+
+        // Withdraw from the engine's insurance surplus. The surplus may be less
+        // than accrued if the market is stressed (insurance was used for bad debt).
+        let mut g = self.load_group(market);
+        let withdrawn = ok(exchange::withdraw_insurance_surplus(&mut g, accrued));
+        self.store_group(market, &g);
+
+        if withdrawn == 0 {
+            return U128(0); // surplus exhausted; ledger unchanged, try later
+        }
+
+        // Debit the ledger by the amount actually withdrawn.
+        let remaining = accrued - withdrawn;
+        self.fee_ledgers.insert(key, remaining);
         self.fee_ledgers.flush();
 
-        // Move from vault to wallet.
-        self.vault_out_to_wallet(&who, accrued);
+        // Move from vault to wallet (engine vault already decremented above).
+        self.vault_out_to_wallet(&who, withdrawn);
 
         emit(
             "fees_claimed",
             serde_json::json!({
                 "market": market,
                 "payee": format!("{:?}", payee),
-                "amount": accrued.to_string(),
+                "amount": withdrawn.to_string(),
                 "owner": who.label(),
             }),
         );
-        U128(accrued)
+        U128(withdrawn)
     }
 
     /// View: get the fee ledger for a market + payee.
