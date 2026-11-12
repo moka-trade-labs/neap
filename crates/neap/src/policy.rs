@@ -146,6 +146,108 @@ pub fn lp_nav_bounds(capital: u128, pnl: i128, fee_credits: i128) -> (u128, u128
     (lower, upper)
 }
 
+// ─────────────────────── 1.2: staleness ladder ───────────────────────
+
+/// Staleness time thresholds in nanoseconds (spec §2).
+pub const STALE_NO_OPENS_NS: u64 = 10_000_000_000; // 10 s
+pub const STALE_REDUCE_ONLY_NS: u64 = 60_000_000_000; // 60 s
+pub const STALE_PRICE_UNCERTAIN_NS: u64 = 3_600_000_000_000; // 1 h
+
+/// Freshness classification for the latest observation (spec §2, invariant 3).
+/// `Ord` derived so callers can compare restriction levels directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StalenessLevel {
+    /// < 10 s: unrestricted.
+    Fresh,
+    /// 10 s – 60 s: no position increases (same as reduce-only for fills).
+    NoOpens,
+    /// 60 s – 1 h: close-only.
+    ReduceOnly,
+    /// ≥ 1 h: no fills at all.
+    PriceUncertain,
+}
+
+/// Classify observation freshness. `age_ns = now_ns - observation.source_ts`.
+pub fn observation_staleness(age_ns: u64) -> StalenessLevel {
+    if age_ns < STALE_NO_OPENS_NS {
+        StalenessLevel::Fresh
+    } else if age_ns < STALE_REDUCE_ONLY_NS {
+        StalenessLevel::NoOpens
+    } else if age_ns < STALE_PRICE_UNCERTAIN_NS {
+        StalenessLevel::ReduceOnly
+    } else {
+        StalenessLevel::PriceUncertain
+    }
+}
+
+// ─────────────────────── 1.2: EMA ───────────────────────
+
+/// EMA smoothing constant: 5% weight on each new sample.
+pub const EMA_ALPHA_BPS: u64 = 500;
+
+/// One EMA step. Truncates the result (conservative floor when rising,
+/// conservative ceiling when falling). Returns `None` if either input is
+/// outside `1..=MAX_PRICE`.
+pub fn ema_next(current_ema: u64, new_price: u64) -> Option<u64> {
+    if current_ema == 0 || current_ema > MAX_PRICE || new_price == 0 || new_price > MAX_PRICE {
+        return None;
+    }
+    let alpha = EMA_ALPHA_BPS as u128;
+    let one_minus = BPS - alpha;
+    let num = alpha
+        .checked_mul(new_price as u128)?
+        .checked_add(one_minus.checked_mul(current_ema as u128)?)?;
+    let result = u64::try_from(num / BPS).ok()?;
+    if result == 0 || result > MAX_PRICE {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+// ─────────────────────── 1.5: dynamic spread + OI caps ───────────────────────
+
+/// Dynamic execution spread (spec §5).
+/// `net_oi_after`: `|oi_long_after − oi_short_after|` in engine units.
+/// `oi_cap`: the relevant OI cap (use 1 if uncapped to avoid /0).
+/// Returns spread in bps, clamped at `MAX_SPREAD_BPS`.
+pub fn dynamic_spread_bps(
+    spread_min_bps: u64,
+    k_skew_bps: u64,
+    k_size_bps: u64,
+    net_oi_after: u128,
+    oi_cap: u128,
+    size_abs: u128,
+) -> u64 {
+    if oi_cap == 0 {
+        return spread_min_bps.min(MAX_SPREAD_BPS);
+    }
+    let skew_bps = (net_oi_after.min(oi_cap) * BPS / oi_cap) as u64;
+    let size_bps = (size_abs.min(oi_cap) * BPS / oi_cap) as u64;
+    let total = spread_min_bps
+        .saturating_add(k_skew_bps.saturating_mul(skew_bps) / BPS as u64)
+        .saturating_add(k_size_bps.saturating_mul(size_bps) / BPS as u64);
+    total.min(MAX_SPREAD_BPS)
+}
+
+/// Leverage ratchet: `Lmax = max(1×, L0 × (1 − |net_oi| / oi_cap))`.
+/// Returns the adjusted max leverage in bps. `oi_cap == 0` ⇒ no ratchet.
+pub fn ratcheted_leverage_max_bps(l0_bps: u64, net_oi_abs: u128, oi_cap: u128) -> u64 {
+    if oi_cap == 0 || net_oi_abs == 0 {
+        return l0_bps;
+    }
+    let skew_bps = (net_oi_abs.min(oi_cap) * BPS / oi_cap) as u64;
+    let reduction = l0_bps.saturating_mul(skew_bps) / BPS as u64;
+    l0_bps.saturating_sub(reduction).max(BPS as u64) // at least 1×
+}
+
+/// True if `new_oi ≤ cap` (cap == 0 means uncapped).
+pub fn oi_within_cap(new_oi: u128, cap: u128) -> bool {
+    cap == 0 || new_oi <= cap
+}
+
+// ─────────────────────── custody ───────────────────────
+
 /// Token custody bookkeeping. The contract's NEP-141 balance must always be at
 /// least `total()`: every token the contract holds is either in some user's
 /// wallet ledger or inside some market group's engine vault (which itself

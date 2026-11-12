@@ -8,3 +8,7 @@ node_modules/
 neardev/
 .DS_Store
 target-wasm/
+
+# Agent worktree isolation scratch dirs
+.claude/
+.claire/

@@ -117,8 +117,13 @@ pub struct Market {
     pub mode: Mode,
     pub price_source: PriceSource,
     pub observation: Observation,
+    /// Exponential moving average of raw observations (step 1.2). Used as the
+    /// staircase target for pool-read markets (step 1.3); for `Pushed` markets
+    /// the raw price is the target.
+    pub ema_e6: u64,
     pub lister: Owner,
     pub bond: u128,
+    /// Minimum spread in bps (also the fixed spread for `Pushed` markets).
     pub spread_bps: u64,
     pub max_oracle_age_ns: u64,
     // Staircase state (engine price walks toward `oracle_target`).
@@ -126,6 +131,13 @@ pub struct Market {
     pub oracle_remainder_bps_num: u16,
     pub oracle_last_publish_ns: u64,
     pub lp_total_shares: u128,
+    // ── step 1.5: OI caps ──
+    /// 0 = uncapped.
+    pub oi_cap_long: u128,
+    /// 0 = uncapped.
+    pub oi_cap_short: u128,
+    /// 0 = uncapped.
+    pub per_account_cap: u128,
 }
 
 impl Market {
@@ -142,6 +154,92 @@ impl Market {
         self.oracle_remainder_bps_num = m.remainder_bps_num;
         self.oracle_last_publish_ns = m.last_publish_ns;
     }
+}
+
+// ─────────────────────── 1.6: two-step orders ───────────────────────
+
+/// Long or short side for a pending order.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderSide {
+    Long,
+    Short,
+}
+
+/// A pending two-step order (spec §4, step 1.6).
+/// Created by `request_order`, filled by `execute_order`, removed by
+/// `cancel_order` or on expiry.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug)]
+pub struct Order {
+    pub id: u64,
+    pub market: u32,
+    pub owner: Owner,
+    pub side: OrderSide,
+    /// Absolute position size in engine units (`POS_SCALE`).
+    pub size_q: u128,
+    /// Limit price: buys fill at ≤ limit, sells at ≥ limit.
+    pub limit_price: u64,
+    /// Block at which the request was recorded.
+    pub request_block: u64,
+    /// Block after which the order expires (inclusive).
+    pub expiry_block: u64,
+    /// True → the fill must reduce the caller's position magnitude.
+    pub reduce_only: bool,
+}
+
+// ─────────────────────── 1.7: conditional orders ───────────────────────
+
+/// Kind of conditional order.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditionalKind {
+    /// Take-profit: triggers when mark ≥ trigger (long) or ≤ trigger (short).
+    /// Always reduce-only.
+    TakeProfit,
+    /// Stop-loss: triggers when mark ≤ trigger (long) or ≥ trigger (short).
+    /// Always reduce-only.
+    StopLoss,
+    /// Resting limit: triggers when mark crosses the trigger price.
+    /// Can be reduce-only or opening.
+    Limit,
+}
+
+/// A conditional order that triggers on mark price (spec §4, step 1.7).
+/// Created by `place_conditional`, executed by `execute_conditional` (keeper),
+/// removed by `cancel_conditional` or on expiry (max 30 days).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug)]
+pub struct ConditionalOrder {
+    pub id: u64,
+    pub market: u32,
+    pub owner: Owner,
+    pub kind: ConditionalKind,
+    pub side: OrderSide,
+    /// Absolute position size in engine units.
+    pub size_q: u128,
+    /// Trigger mark price.
+    pub trigger_price: u64,
+    /// Limit price for the fill (0 = market for sells).
+    pub limit_price: u64,
+    /// Block at which the conditional was placed (the "arm block").
+    pub arm_block: u64,
+    /// Block after which the conditional expires.
+    pub expiry_block: u64,
+    /// True for TP/SL (always), optional for Limit.
+    pub reduce_only: bool,
+}
+
+// ─────────────────────── 1.8: fee payees ───────────────────────
+
+/// Fee recipient category for the per-market fee ledger.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Payee {
+    Lister,
+    Lp,
+    Insurance,
+    Protocol,
 }
 
 /// JSON view of an [`Observation`] with the big integers as strings.
