@@ -528,6 +528,8 @@ impl Neap {
     #[payable]
     pub fn deposit(&mut self, market: u32, amount: U128) {
         assert_one_yocto();
+        let info = self.market(market);
+        require!(info.mode == Mode::Active || info.mode == Mode::ReduceOnly, "market not active");
         let who = Self::user();
         self.debit_wallet(&who, amount.0);
         let mut g = self.load_group(market);
@@ -543,6 +545,8 @@ impl Neap {
     #[payable]
     pub fn withdraw_margin(&mut self, market: u32, amount: U128) {
         assert_one_yocto();
+        let info = self.market(market);
+        require!(info.mode != Mode::Proposed, "market not activated yet");
         let who = Self::user();
         let (mut g, mut info, _pool) = self.load_market_caught_up(market);
         let mut p = self.load_portfolio(market, &who);
@@ -631,7 +635,8 @@ impl Neap {
             .unwrap_or_else(|| env::panic_str("no such order"));
         let market = order.market;
 
-        // Expired?
+        // Expired? Remove and return 0 (M-3 fix: don't panic, which would
+        // revert the removal and leak storage).
         if slot() > order.expiry_block {
             self.orders.remove(&order_id);
             self.orders.flush();
@@ -639,7 +644,7 @@ impl Neap {
                 "order_expired",
                 serde_json::json!({ "id": order_id.to_string(), "market": market }),
             );
-            env::panic_str("order expired");
+            return U64(0);
         }
 
         let mut info = self.market(market);
@@ -649,6 +654,11 @@ impl Neap {
             info.observation.block > order.request_block,
             "observation not newer than request block"
         );
+
+        // H-3 fix: enforce market mode (ReduceOnly blocks position-increasing).
+        if info.mode == Mode::ReduceOnly && !order.reduce_only {
+            env::panic_str("market is reduce-only");
+        }
 
         // 1.2: stale ladder
         let age_ns = env::block_timestamp().saturating_sub(info.observation.source_ts);
@@ -879,14 +889,12 @@ impl Neap {
             block: slot(),
         };
         // For NearPool markets the staircase target is the EMA (smoothed).
-        let mut g = self.load_group(market);
-        let pool = self.load_pool(market);
-        let mut meta = info.meta();
-        meta.target = info.ema_e6;
-        meta.last_publish_ns = env::block_timestamp();
-        ok(exchange::catch_up(&mut g, &mut meta, &pool, slot()));
-        info.set_meta(meta);
-        self.store_group(market, &g);
+        // ATOMICITY: only write the oracle meta here — never mutate the engine
+        // in a callback (C-2 fix). The keeper's `crank` call catches up the
+        // engine in a separate, non-callback receipt.
+        info.oracle_target = info.ema_e6;
+        info.oracle_last_publish_ns = env::block_timestamp();
+        info.oracle_remainder_bps_num = 0; // reset remainder on new target
         self.save_market(market, &mut info);
         emit(
             "price_observed",
@@ -1060,7 +1068,7 @@ impl Neap {
                 "order_expired",
                 serde_json::json!({ "id": cond_id.to_string(), "market": market }),
             );
-            env::panic_str("conditional expired");
+            return U64(0); // M-3 fix: don't panic (reverts removal)
         }
 
         let mut info = self.market(market);
@@ -1513,6 +1521,14 @@ impl Neap {
     pub fn liquidate(&mut self, market: u32, account: AccountId) -> U128 {
         let caller = Self::user();
         let account = Owner::Near(account);
+        let info_check = self.market(market);
+        // H-2 fix: no liquidation with stale/uncertain prices.
+        let age_ns = env::block_timestamp().saturating_sub(info_check.observation.source_ts);
+        let staleness = policy::observation_staleness(age_ns);
+        require!(
+            staleness < StalenessLevel::PriceUncertain,
+            "price uncertain: no liquidation"
+        );
         let (mut g, mut info, _pool) = self.load_market_caught_up(market);
         let mut p = self.load_portfolio(market, &account);
         let out = ok(exchange::liquidate(&mut g, &mut p));
@@ -1721,6 +1737,22 @@ impl Neap {
             }
         }
         self.fee_ledgers.flush();
+    }
+
+    /// C-1 fix: require the market is Active or ReduceOnly.
+    fn require_market_active_or_reduce_only(&self, market: u32) {
+        let info = self.market(market);
+        require!(
+            info.mode == Mode::Active || info.mode == Mode::ReduceOnly,
+            "market not active"
+        );
+    }
+
+    /// Allow everything except Proposed (for withdrawals, which should work
+    /// in ReduceOnly, PriceUncertain, etc. so users can exit).
+    fn require_market_not_proposed(&self, market: u32) {
+        let info = self.market(market);
+        require!(info.mode != Mode::Proposed, "market not activated yet");
     }
 
     /// 1.9: check that the caller is the pauser or the owner.

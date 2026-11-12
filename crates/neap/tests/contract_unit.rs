@@ -448,7 +448,6 @@ fn same_block_execute_refused() {
 }
 
 #[test]
-#[should_panic(expected = "order expired")]
 fn expired_order_is_cleaned_up() {
     let (mut e, mut c) = setup();
     let bob = setup_bob(&mut e, &mut c);
@@ -460,7 +459,11 @@ fn expired_order_is_cleaned_up() {
     e.call(&oracle(), NearToken::from_yoctonear(0));
     c.push_price(0, U64(PRICE), U64(e.ts));
     e.call(&accounts(3), NearToken::from_yoctonear(0));
-    c.execute_order(oid.0); // panics: expired
+    // Returns 0 (no fill) and removes the order from storage.
+    let result = c.execute_order(oid.0);
+    assert_eq!(result.0, 0, "expired order returns 0");
+    // Verify order was removed.
+    assert!(c.get_order(oid.0).is_none(), "order removed from storage");
 }
 
 #[test]
