@@ -283,3 +283,99 @@ Output: `crates/neap/target-wasm/wasm32-unknown-unknown/release/neap.wasm` (699.
 SHA-256: `980c6dfb0a1a247939b0fe4fb6722a7784e86c2d2698a6266f02df167575eeed`
 
 **Deployed WASM matches local build** (verified via `near account view-account-summary`).
+
+## Run tests yourself
+
+### Prerequisites
+```bash
+# Rust toolchain
+rustup target add wasm32-unknown-unknown
+
+# NEAR CLI
+cargo install near-cli-rs
+
+# Postgres (only for indexer — skip if you just want contract tests)
+# Use Neon (https://neon.tech) free tier or local: brew install postgresql
+```
+
+### 1. Unit tests (no network needed)
+```bash
+cd neap
+cargo test -p neap
+# Expected: 48 passed (5 suites)
+```
+
+### 2. Build the WASM
+```bash
+RUSTFLAGS="--cfg near -C link-arg=-s" CARGO_TARGET_DIR=crates/neap/target-wasm \
+  cargo build --target wasm32-unknown-unknown --release -p neap
+# Output: crates/neap/target-wasm/wasm32-unknown-unknown/release/neap.wasm
+```
+
+### 3. Sandbox tests (real NEAR runtime, no testnet needed)
+```bash
+# Build mock contracts first
+cd crates/neap/sandbox/mock-ft
+RUSTFLAGS="--cfg near" CARGO_TARGET_DIR=../../target-wasm \
+  cargo build --target wasm32-unknown-unknown --release
+cd ../mock-ref-pool
+RUSTFLAGS="--cfg near" CARGO_TARGET_DIR=../../target-wasm \
+  cargo build --target wasm32-unknown-unknown --release
+cd ..
+
+# Run sandbox tests
+cargo test --release -- --nocapture
+# Expected: 2 passed (sandbox_flow_and_gas + sandbox_refresh_price_near_pool)
+```
+
+### 4. Build the keeper
+```bash
+cargo build -p neap-keeper
+# Expected: 0 errors
+```
+
+### 5. Run the keeper (needs testnet key)
+```bash
+NEAP_CONTRACT=neap-trade.testnet \
+NEAP_SIGNER=neap-trade.testnet \
+NEAP_SIGNER_KEY="ed25519:..." \
+NEAP_MARKETS=0 \
+NEAP_PUSH_PRICE=5100000 \
+NEAP_LOOP_MS=10000 \
+RUST_LOG=info \
+cargo run -p neap-keeper
+# You should see: "pushed price" and "cranked" logs
+```
+
+### 6. Build the indexer
+```bash
+cargo build -p neap-indexer
+# Expected: 0 errors
+```
+
+### 7. Run the indexer (needs Postgres)
+```bash
+NEAP_CONTRACT=neap-trade.testnet \
+DATABASE_URL=postgres://user:pass@localhost/neap \
+API_PORT=3000 \
+RUST_LOG=info \
+cargo run -p neap-indexer
+# API at http://localhost:3000/markets
+# WebSocket at ws://localhost:3000/ws
+```
+
+### 8. Verify testnet contract (no local setup needed)
+```bash
+# Check the market is live
+near contract call-function as-read-only neap-trade.testnet get_market \
+  json-args '{"market": 0}' network-config testnet now
+
+# Check the quote
+near contract call-function as-read-only neap-trade.testnet quote \
+  json-args '{"market":0,"side":"Long","size_q":"1000000"}' \
+  network-config testnet now
+
+# Check fee ledger
+near contract call-function as-read-only neap-trade.testnet get_fee_ledger \
+  json-args '{"market":0,"payee":"Lister"}' network-config testnet now
+```
