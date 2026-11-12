@@ -1614,6 +1614,48 @@ impl Neap {
             position_q: I128(ok(exchange::effective_position_q(&g, &p))),
         })
     }
+
+    // ─────────────────── keeper views (1.10) ───────────────────
+
+    /// The next order ID that will be assigned (keeper scans 0..next_order_id).
+    pub fn get_next_order_id(&self) -> U64 {
+        U64(self.next_order_id)
+    }
+
+    /// Look up a single pending order. Returns `None` if it doesn't exist
+    /// (already executed, cancelled, or never created).
+    pub fn get_order(&self, order_id: u64) -> Option<Order> {
+        self.orders.get(&order_id).cloned()
+    }
+
+    /// Look up a single conditional order.
+    pub fn get_conditional(&self, cond_id: u64) -> Option<ConditionalOrder> {
+        self.conditionals.get(&cond_id).cloned()
+    }
+
+    /// Scan for existing order/conditional IDs in a range. The keeper calls
+    /// this to discover work without an indexer. Returns IDs that exist in
+    /// `[from_id, from_id+limit)`.
+    pub fn scan_order_ids(&self, from_id: u64, limit: u32) -> Vec<U64> {
+        let mut out = Vec::new();
+        for id in from_id..from_id.saturating_add(limit as u64) {
+            if self.orders.contains_key(&id) {
+                out.push(U64(id));
+            }
+        }
+        out
+    }
+
+    /// Scan for existing conditional IDs in a range.
+    pub fn scan_conditional_ids(&self, from_id: u64, limit: u32) -> Vec<U64> {
+        let mut out = Vec::new();
+        for id in from_id..from_id.saturating_add(limit as u64) {
+            if self.conditionals.contains_key(&id) {
+                out.push(U64(id));
+            }
+        }
+        out
+    }
 }
 
 // ───────────────────────────── internals ─────────────────────────────

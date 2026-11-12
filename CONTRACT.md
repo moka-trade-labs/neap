@@ -96,6 +96,15 @@ TX: 7EXwSpodRmK1PrKFy5tYCTLLzSBbtwCkTWUqEz92yyY5
 ```
 Added `ed25519:DvT51sFiedZNjz1tRP4Ve2L6n8C27bYMcRwnAzjwysjn` as full-access key.
 
+### Step 8: Keeper verified on testnet
+The keeper service (`services/keeper/`) connected to testnet and ran one full tick:
+
+1. Connected to testnet RPC (`https://rpc.testnet.near.org`)
+2. Pushed price `5000000` ($5.00) → TX `7ihpS9PGsC3LuB43RYWmKmoy6F4ysUa5GfpShHaChX2T`
+3. Cranked market 0 → TX `BxZ3kvR8yux9zZjQjXSSAVNJgmefjV2oKriEHe5q7YcT`
+
+Market state after: `mode: Active`, `seq: 2`, `effective_price: 5000000`, `slot_last: 277352697`.
+
 ## How to verify
 
 ```bash
