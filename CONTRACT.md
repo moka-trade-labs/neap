@@ -105,6 +105,57 @@ The keeper service (`services/keeper/`) connected to testnet and ran one full ti
 
 Market state after: `mode: Active`, `seq: 2`, `effective_price: 5000000`, `slot_last: 277352697`.
 
+### Step 9: Security fixes + contract redeployment (2026-11-12)
+Redeployed with 5 security fixes (see `docs/security-audit-2026-11-12.md`):
+```
+TX: CLtndaabh7diB3s9t9AEBtSQTFbcwUzzJw2EZkUe9Nb3
+WASM SHA-256: 980c6dfb0a1a247939b0fe4fb6722a7784e86c2d2698a6266f02df167575eeed
+Size: 699.5 KB
+```
+Fixes: C-1 (mode gates), C-2 (atomicity), H-2 (staleness on liquidate), H-3 (ReduceOnly enforcement), M-3 (expired order storage leak).
+
+### Step 10: Full retest (2026-11-12)
+
+**Unit tests:** 48 passed (5 suites)
+**Sandbox tests:** 2 passed (full flow + NearPool refresh_price)
+**Builds:** neap WASM (0 errors), keeper (0 errors), indexer (0 errors)
+
+**Testnet verification (all succeeded):**
+
+| Test | Result | TX |
+|------|--------|-----|
+| `get_market(0)` | Active, NEAR-PERP, $5.10, seq=4 | (view) |
+| `get_markets_count` | 1 | (view) |
+| `get_lp_shares(0, ops)` | 50000000000000 | (view) |
+| `get_next_order_id` | 2 | (view) |
+| `push_price($5.10)` | Succeeded | `3RqFz8eRDjDbjjmCRF2LHGDnkkcXYWuvbhpqdxkfrDhs` |
+| `crank(0)` | Succeeded | `DNQj51JntiKFUg4VnDEvpQtWkFAHu4xR7WcMoF4WFVJd` |
+| `quote(Long, 1 unit)` | $5.1025, 5bps spread | (view) |
+| `get_fee_ledger(Lister)` | 2550 atoms | (view) |
+| `get_fee_ledger(Protocol)` | 513 atoms | (view) |
+
+**Full trade flow tested on testnet:**
+
+| Step | Account | TX status |
+|------|---------|-----------|
+| Create `trader.neap-trade.testnet` | — | Succeeded |
+| Register on USDC + mint 10 USDC | trader | Succeeded |
+| Register on neap | trader | Succeeded |
+| Deposit 5 USDC via ft_transfer_call | trader | Succeeded |
+| open_account(market=0) | trader | Succeeded |
+| deposit(market=0, 5 USDC) | trader | Succeeded |
+| request_order(Long, 1 unit) | trader | order_id=0, Succeeded |
+| push_price($5.10) | oracle | Succeeded |
+| execute_order(0) | oracle (keeper) | Fill price $5.10, Succeeded |
+| get_account → position=1000000 (1 unit) | — | Verified |
+| request_order(Short, 1 unit, reduce_only) | trader | order_id=1, Succeeded |
+| push_price($5.10) | oracle | Succeeded |
+| execute_order(1) | oracle (keeper) | Closed, Succeeded |
+| get_account → position=0 (flat) | — | Verified |
+| withdraw_margin(4994899) | trader | Succeeded |
+| withdraw(4994899) | trader | Succeeded |
+| ft_balance_of(trader) | — | 9994899 (started 10M, lost ~5101 in fees) |
+
 ## How to verify
 
 ```bash
@@ -228,5 +279,7 @@ near contract call-function as-read-only neap-trade.testnet get_account \
 RUSTFLAGS="--cfg near -C link-arg=-s" CARGO_TARGET_DIR=crates/neap/target-wasm \
   cargo build --target wasm32-unknown-unknown --release -p neap
 ```
-Output: `crates/neap/target-wasm/wasm32-unknown-unknown/release/neap.wasm` (687 KB)
-SHA-256: `99759e2d1cf265691a92d845a7df58dc921c08bc9ffa65229c420d7c0ed8b5ae`
+Output: `crates/neap/target-wasm/wasm32-unknown-unknown/release/neap.wasm` (699.5 KB)
+SHA-256: `980c6dfb0a1a247939b0fe4fb6722a7784e86c2d2698a6266f02df167575eeed`
+
+**Deployed WASM matches local build** (verified via `near account view-account-summary`).
