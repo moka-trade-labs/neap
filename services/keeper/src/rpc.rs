@@ -43,7 +43,7 @@ impl NearRpc {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(8))
             .build()?;
         let rpc = Self {
             client,
@@ -86,7 +86,7 @@ impl NearRpc {
         );
         let resp = self.rpc_call("query", json!({
             "request_type": "call_function",
-            "finality": "final",
+            "finality": "optimistic",
             "account_id": self.contract_id.to_string(),
             "method_name": method,
             "args_base64": args_b64,
