@@ -148,7 +148,14 @@ pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) ->
             Ok(None) => cursor = h,
             Err(e) => {
                 warn!(block = h, err = %e, "block fetch failed, retrying");
-                tokio::time::sleep(interval.max(std::time::Duration::from_secs(3))).await;
+                tokio::time::sleep(interval.max(std::time::Duration::from_secs(6))).await;
+                // If the block API keeps refusing us, don't build a backlog we can never clear.
+                if let Ok(head) = latest_block(&client, &base).await {
+                    if head.saturating_sub(cursor) > config.max_catchup_blocks {
+                        warn!(cursor, head, "too far behind, jumping to head");
+                        cursor = head;
+                    }
+                }
             }
         }
     }

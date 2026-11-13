@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS observations (
     ts          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_obs_market_block ON observations(market_id, block);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_market_seq ON observations(market_id, seq);
 
 CREATE TABLE IF NOT EXISTS candles (
     market_id   INTEGER NOT NULL REFERENCES markets(id),

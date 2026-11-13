@@ -140,6 +140,10 @@ async fn refresh_once(
                 warn!(market = id, err = %e, "market upsert failed");
             }
         }
+        let _ = crate::db::ensure_market(pool, id as i32).await;
+        if let Err(e) = crate::db::upsert_observation_from_view(pool, id as i32, &v).await {
+            warn!(market = id, err = %e, "observation upsert failed");
+        }
         let _ = tx.send(json!({ "event": "market_state", "data": v }).to_string());
         out.push(v);
     }

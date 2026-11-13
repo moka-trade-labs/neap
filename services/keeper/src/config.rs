@@ -50,7 +50,7 @@ impl Config {
         let testnet = contract_id.ends_with(".testnet");
         let rpc_url = env_or(
             "NEAR_RPC_URL",
-            if testnet { "https://test.rpc.fastnear.com,https://rpc.testnet.near.org" } else { "https://free.rpc.fastnear.com" },
+            if testnet { "https://test.rpc.fastnear.com,https://near-testnet.drpc.org,https://near-testnet.gateway.tatum.io,https://rpc.testnet.near.org" } else { "https://free.rpc.fastnear.com" },
         );
         let signer_id = std::env::var("NEAP_SIGNER").context("NEAP_SIGNER env var required")?;
         let signer_key = std::env::var("NEAP_SIGNER_KEY").context("NEAP_SIGNER_KEY env var required")?;

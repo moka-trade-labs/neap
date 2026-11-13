@@ -38,7 +38,7 @@ impl Config {
         Ok(Self {
             rpc_url: env_or(
                 "NEAR_RPC_URL",
-                if mainnet { "https://free.rpc.fastnear.com" } else { "https://test.rpc.fastnear.com,https://rpc.testnet.near.org" },
+                if mainnet { "https://free.rpc.fastnear.com" } else { "https://test.rpc.fastnear.com,https://near-testnet.drpc.org,https://near-testnet.gateway.tatum.io,https://rpc.testnet.near.org" },
             ),
             neardata_url: env_or(
                 "NEARDATA_URL",

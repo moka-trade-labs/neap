@@ -156,7 +156,7 @@ impl NearRpc {
             &tx_bytes,
         );
 
-        let resp = match self.rpc_call("broadcast_tx_commit", json!([tx_b64])).await {
+        let resp = match self.send_tx(&tx_b64).await {
             Ok(r) => r,
             Err(e) => {
                 // Nonce/blockhash problems: resync so the next call works.
@@ -195,7 +195,7 @@ impl NearRpc {
         let signature = self.signer.secret_key.sign(tx_hash.as_ref());
         let signed = near_primitives::transaction::SignedTransaction::new(signature, tx);
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, borsh::to_vec(&signed)?);
-        let resp = self.rpc_call("broadcast_tx_commit", json!([tx_b64])).await?;
+        let resp = self.send_tx(&tx_b64).await?;
         Ok(resp["transaction"]["hash"].as_str().unwrap_or("unknown").to_string())
     }
 
@@ -217,6 +217,27 @@ impl NearRpc {
 
     pub fn signer_id(&self) -> &AccountId {
         &self.signer_id
+    }
+
+    /// Broadcast a signed tx and wait for execution. A rate-limited or
+    /// unsupported RPC rotates and the same signed tx is sent to the next one
+    /// (same hash, so a duplicate is harmless).
+    async fn send_tx(&self, tx_b64: &str) -> Result<Value> {
+        let n = self.rpc_urls.len().max(1);
+        let params = json!({ "signed_tx_base64": tx_b64, "wait_until": "EXECUTED_OPTIMISTIC" });
+        let mut last = anyhow!("no rpc configured");
+        for _ in 0..n {
+            let idx = self.rpc_idx.load(Ordering::Relaxed) % n;
+            match self.rpc_call_on(&self.rpc_urls[idx], "send_tx", &params).await {
+                Ok(v) => return Ok(v),
+                Err((true, e)) => {
+                    self.rpc_idx.store((idx + 1) % n, Ordering::Relaxed);
+                    last = e;
+                }
+                Err((false, e)) => return Err(e),
+            }
+        }
+        Err(last)
     }
 
     /// JSON-RPC call. Rate limits and transport errors rotate to the next
@@ -256,6 +277,9 @@ impl NearRpc {
                 || es.contains("-32601")
                 || es.contains("not available");
             return Err((rotate, anyhow!("RPC error on {method}: {err}")));
+        }
+        if limited {
+            return Err((true, anyhow!("RPC {url} unavailable for {method}")));
         }
         resp.get("result")
             .cloned()

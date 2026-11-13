@@ -98,7 +98,8 @@ pub async fn process_event(
                 .unwrap_or(0);
             sqlx::query(
                 "INSERT INTO observations (market_id, price_e6, ema_e6, liquidity, seq, block, ts)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (market_id, seq) DO NOTHING",
             )
             .bind(market_id)
             .bind(price_e6)
@@ -390,5 +391,33 @@ pub async fn reset_for_contract(pool: &PgPool, contract: &str) -> Result<()> {
         .bind(contract)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Record the observation shown by `get_market` (the block feed can miss
+/// events when the free block API rate-limits us; this keeps charts whole).
+pub async fn upsert_observation_from_view(pool: &PgPool, id: i32, v: &serde_json::Value) -> Result<()> {
+    let o = &v["observation"];
+    let num = |x: &serde_json::Value| x.as_str().and_then(|s| s.parse::<i64>().ok());
+    let (Some(price), Some(seq), Some(block)) = (num(&o["price_e6"]), num(&o["seq"]), num(&o["block"])) else {
+        return Ok(());
+    };
+    if seq == 0 || price == 0 {
+        return Ok(());
+    }
+    let ts_ns: i64 = num(&o["source_ts"]).unwrap_or(0);
+    sqlx::query(
+        "INSERT INTO observations (market_id, price_e6, liquidity, seq, block, ts)
+         VALUES ($1, $2, $3, $4, $5, to_timestamp($6::double precision / 1e9))
+         ON CONFLICT (market_id, seq) DO NOTHING",
+    )
+    .bind(id)
+    .bind(price)
+    .bind(num(&o["liquidity_usd"]).unwrap_or(0))
+    .bind(seq)
+    .bind(block)
+    .bind(ts_ns as f64)
+    .execute(pool)
+    .await?;
     Ok(())
 }
