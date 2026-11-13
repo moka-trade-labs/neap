@@ -383,7 +383,7 @@ pub async fn get_state(pool: &PgPool, key: &str) -> Result<Option<String>> {
 /// Drop every indexed row and remember which contract the tables now belong to.
 pub async fn reset_for_contract(pool: &PgPool, contract: &str) -> Result<()> {
     sqlx::raw_sql(
-        "TRUNCATE observations, candles, orders, conditionals, fills, liquidations, fee_claims, markets, indexer_state",
+        "TRUNCATE observations, candles, orders, conditionals, fills, liquidations, fee_claims, markets, indexer_state, seen_receipts",
     )
     .execute(pool)
     .await?;
@@ -420,4 +420,14 @@ pub async fn upsert_observation_from_view(pool: &PgPool, id: i32, v: &serde_json
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Remember a receipt. Returns false when it was already indexed (the block
+/// feed and the per-transaction path can both deliver the same receipt).
+pub async fn mark_receipt(pool: &PgPool, receipt_id: &str) -> Result<bool> {
+    let r = sqlx::query("INSERT INTO seen_receipts (receipt_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(receipt_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() == 1)
 }

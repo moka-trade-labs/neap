@@ -105,3 +105,9 @@ CREATE TABLE IF NOT EXISTS fee_claims (
     block       BIGINT NOT NULL,
     ts          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Receipts already indexed (block feed and POST /tx can overlap).
+CREATE TABLE IF NOT EXISTS seen_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    seen_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);

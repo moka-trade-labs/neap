@@ -21,6 +21,8 @@ pub struct NearRpc {
     signer: InMemorySigner,
     nonce: AtomicU64,
     block_hash: std::sync::Mutex<CryptoHash>,
+    /// Indexer base URL: every state-changing contract tx hash is reported to it.
+    notify: Option<String>,
 }
 
 impl NearRpc {
@@ -54,6 +56,7 @@ impl NearRpc {
             signer,
             nonce: AtomicU64::new(0),
             block_hash: std::sync::Mutex::new(CryptoHash::default()),
+            notify: std::env::var("NEAP_INDEXER_URL").ok().filter(|s| !s.is_empty()),
         };
         rpc.refresh_access_key().await?;
         Ok(rpc)
@@ -174,6 +177,17 @@ impl NearRpc {
             .as_str()
             .unwrap_or("unknown")
             .to_string();
+        // Price updates are read from views; everything else carries events.
+        let quiet = matches!(method.as_str(), "push_price" | "refresh_price" | "crank");
+        if let (Some(base), false, true) = (&self.notify, quiet, receiver == &self.contract_id) {
+            let req = self
+                .client
+                .post(format!("{}/tx", base.trim_end_matches('/')))
+                .json(&json!({ "hash": hash, "signer_id": self.signer_id.to_string() }));
+            tokio::spawn(async move {
+                let _ = req.send().await;
+            });
+        }
         Ok(hash)
     }
 

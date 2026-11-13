@@ -32,6 +32,33 @@ impl Chain {
         &self.contract_id
     }
 
+    /// Any JSON-RPC method, tried on each RPC in turn.
+    pub async fn rpc(&self, method: &str, params: &Value) -> Result<Value> {
+        use std::sync::atomic::Ordering;
+        let n = self.rpc_urls.len().max(1);
+        let start = self.next.load(Ordering::Relaxed);
+        let mut last = anyhow!("no rpc configured");
+        for i in 0..n {
+            let url = &self.rpc_urls[(start + i) % n];
+            let mut req = self.client.post(url);
+            if url.contains("fastnear") {
+                if let Some(k) = crate::config::fastnear_key() {
+                    req = req.bearer_auth(k);
+                }
+            }
+            let body = json!({ "jsonrpc": "2.0", "id": "idx", "method": method, "params": params });
+            let resp: Result<Value> = async { Ok(req.json(&body).send().await?.json().await?) }.await;
+            match resp {
+                Ok(v) => match v.get("result") {
+                    Some(r) if v.get("error").is_none() => return Ok(r.clone()),
+                    _ => last = anyhow!("rpc error on {method}: {}", v["error"]),
+                },
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
     /// Call a view method on the neap contract and parse its JSON result.
     /// Tries each RPC in turn (starting with the last one that worked).
     pub async fn view(&self, method: &str, args: &Value) -> Result<Value> {

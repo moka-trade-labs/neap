@@ -58,6 +58,7 @@ Deployment (indexer + keeper in one container): `deploy/Dockerfile`, `deploy/sta
 | GET | `/accounts` | `[{owner, market}]` seen trading (used by the keeper's liquidation scan) |
 | GET | `/view/:method?args={json}` | Read-only proxy for contract views (allow-listed) |
 | POST | `/faucet` body `{"account_id": "you.testnet"}` | Registers the account on test USDC and mints 1,000 USDC. One per account per hour |
+| POST | `/tx` body `{"hash": "<tx hash>", "signer_id": "you.testnet"}` | Report a transaction you just sent to the contract so its events (order, fill, deposit, LP, market) are indexed within seconds. Returns 202. Call it after every wallet transaction; the block feed is only a backup |
 | WS | `/ws` | JSON messages, any origin |
 
 Pagination: `?limit=50&offset=0` (max 500).

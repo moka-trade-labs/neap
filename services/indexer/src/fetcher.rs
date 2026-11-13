@@ -127,7 +127,15 @@ pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) ->
         let h = cursor + 1;
         match fetch_block(&client, &base, &config.contract_id, h).await {
             Ok(Some(be)) => {
+                let mut fresh: std::collections::HashMap<&str, bool> = Default::default();
                 for (rid, ev) in &be.events {
+                    if !fresh.contains_key(rid.as_str()) {
+                        let f = db::mark_receipt(&pool, rid).await.unwrap_or(true);
+                        fresh.insert(rid.as_str(), f);
+                    }
+                    if !fresh[rid.as_str()] {
+                        continue;
+                    }
                     if let Err(e) = db::process_event(&pool, ev, h, be.ts).await {
                         error!(block = h, event = %ev.event, err = %e, "db write failed");
                     }
