@@ -1975,6 +1975,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "reqwest",
@@ -1992,6 +1993,7 @@ name = "neap-keeper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "borsh",
  "bs58 0.5.1",

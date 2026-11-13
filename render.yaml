@@ -1,0 +1,39 @@
+# Render Blueprint: Neap backend (indexer + API + keeper) and its Postgres.
+# Dashboard → New → Blueprint → pick this repo. Then set NEAP_SIGNER_KEY.
+services:
+  - type: web
+    name: neap-backend
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./deploy/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NEAP_CONTRACT
+        value: neap-trade.testnet
+      - key: NEAP_SIGNER
+        value: neap-trade.testnet
+      - key: NEAP_SIGNER_KEY
+        sync: false # paste the oracle account's private key (ed25519:...) in the dashboard
+      - key: NEAR_RPC_URL
+        value: https://test.rpc.fastnear.com
+      - key: NEAP_LOOP_MS
+        value: "3000"
+      - key: FAUCET_TOKEN
+        value: usdc.fakes.testnet
+      - key: FAUCET_AMOUNT
+        value: "1000000000" # 1,000 test USDC
+      - key: RUST_LOG
+        value: info,neap_keeper=info
+      - key: DATABASE_URL
+        fromDatabase:
+          name: neap-db
+          property: connectionString
+
+databases:
+  - name: neap-db
+    plan: free
+    region: oregon
+    databaseName: neap

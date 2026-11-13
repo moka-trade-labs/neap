@@ -7,14 +7,16 @@
 //!   cargo run -p neap-indexer
 
 mod api;
+mod chain;
 mod config;
 mod db;
 mod events;
 mod fetcher;
 
 use anyhow::Result;
-use sqlx::PgPool;
-use tokio::sync::broadcast;
+use sqlx::postgres::PgPoolOptions;
+use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -27,35 +29,70 @@ async fn main() -> Result<()> {
         .init();
 
     let config = config::Config::from_env()?;
-    info!(contract = %config.contract_id, port = config.api_port, "indexer starting");
+    info!(contract = %config.contract_id, port = config.api_port, rpc = %config.rpc_url,
+          neardata = %config.neardata_url, "indexer starting");
 
-    // Connect to Postgres and run migrations.
-    let pool = PgPool::connect(&config.database_url).await?;
-    sqlx::query(include_str!("../migrations/001_init.sql"))
+    // Connect to Postgres and run the (idempotent, multi-statement) schema.
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&config.database_url)
+        .await?;
+    sqlx::raw_sql(include_str!("../migrations/001_init.sql"))
         .execute(&pool)
         .await?;
     info!("database migrations applied");
 
     // Broadcast channel for WebSocket subscribers.
-    let (tx, _) = broadcast::channel::<String>(256);
+    let (tx, _) = broadcast::channel::<String>(1024);
 
-    // Spawn the block fetcher.
-    let fetcher_pool = pool.clone();
-    let fetcher_config = config.clone();
-    let fetcher_tx = tx.clone();
-    tokio::spawn(async move {
-        if let Err(e) = fetcher::run(fetcher_config, fetcher_pool, fetcher_tx).await {
-            tracing::error!(err = %e, "fetcher crashed");
-        }
-    });
+    // Live market state from contract views (also seeds the markets table).
+    let chain = chain::Chain::new(&config.rpc_url, &config.contract_id);
+    let live: chain::LiveMarkets = Arc::new(RwLock::new(Vec::new()));
+    tokio::spawn(chain::run_live_poller(
+        chain.clone(),
+        pool.clone(),
+        live.clone(),
+        tx.clone(),
+        std::time::Duration::from_millis(config.live_refresh_ms),
+    ));
 
-    // Start the API server.
-    let state = api::AppState { pool, tx };
+    // Block fetcher; restart it if it ever returns an error.
+    {
+        let (pool, config, tx) = (pool.clone(), config.clone(), tx.clone());
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = fetcher::run(config.clone(), pool.clone(), tx.clone()).await {
+                    tracing::error!(err = %e, "fetcher crashed, restarting in 5s");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+
+    // Keep a free-tier host awake by pinging our own public URL.
+    if let Ok(url) = std::env::var("KEEPALIVE_URL").or_else(|_| std::env::var("RENDER_EXTERNAL_URL")) {
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                let _ = client.get(format!("{}/health", url.trim_end_matches('/'))).send().await;
+            }
+        });
+    }
+
+    let state = api::AppState {
+        pool,
+        tx,
+        chain,
+        live,
+        keeper_url: std::env::var("KEEPER_INTERNAL_URL").ok(),
+        http: reqwest::Client::new(),
+    };
     let app = api::router(state);
     let addr = format!("0.0.0.0:{}", config.api_port);
     info!(addr = %addr, "API server listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
 
     Ok(())
 }

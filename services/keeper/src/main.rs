@@ -18,7 +18,9 @@
 
 mod config;
 mod contract;
+mod faucet;
 mod keeper;
+mod price;
 mod rpc;
 
 use anyhow::Result;
