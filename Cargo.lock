@@ -1997,6 +1997,7 @@ dependencies = [
  "base64 0.22.1",
  "borsh",
  "bs58 0.5.1",
+ "futures",
  "near-crypto 0.29.2",
  "near-primitives 0.29.2",
  "reqwest",

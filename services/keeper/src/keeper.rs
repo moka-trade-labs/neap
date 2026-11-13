@@ -143,9 +143,11 @@ async fn liquidation_scan(rpc: &NearRpc, http: &reqwest::Client, indexer: &str) 
 /// One full keeper pass.
 pub async fn tick(rpc: &NearRpc, config: &Config, http: &reqwest::Client, n: u64) -> Result<()> {
     let ms = markets(rpc, config).await;
-    for m in &ms {
+    // Markets are independent: update them concurrently so one slow tx does
+    // not make every other market's price stale.
+    futures::future::join_all(ms.iter().map(|m| async move {
         if m.mode == "WindDown" || m.mode == "Recovery" {
-            continue;
+            return;
         }
         let pushed = update_price(rpc, config, http, m).await;
         if m.mode == "Proposed" && m.seq > 0 {
@@ -159,7 +161,8 @@ pub async fn tick(rpc: &NearRpc, config: &Config, http: &reqwest::Client, n: u64
                 warn!(market = m.id, err = %e, "crank failed");
             }
         }
-    }
+    }))
+    .await;
     scan_and_execute(rpc, false).await;
     scan_and_execute(rpc, true).await;
     if let Some(indexer) = &config.indexer_url {
