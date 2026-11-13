@@ -249,7 +249,12 @@ impl NearRpc {
         let resp: Value = resp.json().await.map_err(|e| (true, e.into()))?;
         if let Some(err) = resp.get("error") {
             let es = err.to_string();
-            let rotate = limited || es.contains("429") || es.contains("Rate limit") || es.contains("rate limit");
+            let rotate = limited
+                || es.contains("429")
+                || es.contains("Rate limit")
+                || es.contains("rate limit")
+                || es.contains("-32601")
+                || es.contains("not available");
             return Err((rotate, anyhow!("RPC error on {method}: {err}")));
         }
         resp.get("result")
