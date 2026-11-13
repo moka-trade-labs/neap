@@ -10,7 +10,8 @@ use tracing::warn;
 #[derive(Clone)]
 pub struct Chain {
     client: reqwest::Client,
-    rpc_url: String,
+    rpc_urls: Vec<String>,
+    next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     contract_id: String,
 }
 
@@ -21,7 +22,8 @@ impl Chain {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),
-            rpc_url: rpc_url.to_string(),
+            rpc_urls: rpc_url.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect(),
+            next: Default::default(),
             contract_id: contract_id.to_string(),
         }
     }
@@ -31,12 +33,37 @@ impl Chain {
     }
 
     /// Call a view method on the neap contract and parse its JSON result.
+    /// Tries each RPC in turn (starting with the last one that worked).
     pub async fn view(&self, method: &str, args: &Value) -> Result<Value> {
+        use std::sync::atomic::Ordering;
+        let n = self.rpc_urls.len().max(1);
+        let start = self.next.load(Ordering::Relaxed);
+        let mut last = anyhow!("no rpc configured");
+        for i in 0..n {
+            let idx = (start + i) % n;
+            match self.view_on(&self.rpc_urls[idx], method, args).await {
+                Ok(v) => {
+                    self.next.store(idx, Ordering::Relaxed);
+                    return Ok(v);
+                }
+                Err(e) => {
+                    // A contract-level error is the same on every RPC.
+                    if e.to_string().starts_with("view error") {
+                        return Err(e);
+                    }
+                    last = e;
+                }
+            }
+        }
+        Err(last)
+    }
+
+    async fn view_on(&self, rpc_url: &str, method: &str, args: &Value) -> Result<Value> {
         use base64::Engine;
         let args_b64 = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(args)?);
         let resp: Value = self
             .client
-            .post(&self.rpc_url)
+            .post(rpc_url)
             .json(&json!({
                 "jsonrpc": "2.0", "id": "idx", "method": "query",
                 "params": {
@@ -52,6 +79,10 @@ impl Chain {
             .json()
             .await?;
         if let Some(err) = resp.get("error") {
+            let es = err.to_string();
+            if es.contains("FunctionCallError") || es.contains("MethodNotFound") || es.contains("CONTRACT_EXECUTION_ERROR") {
+                return Err(anyhow!("view error: {err}"));
+            }
             return Err(anyhow!("rpc error: {err}"));
         }
         if let Some(err) = resp["result"].get("error") {

@@ -370,3 +370,25 @@ pub async fn upsert_market_from_view(pool: &PgPool, id: i32, v: &serde_json::Val
     .await?;
     Ok(())
 }
+
+pub async fn get_state(pool: &PgPool, key: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM indexer_state WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(v,)| v))
+}
+
+/// Drop every indexed row and remember which contract the tables now belong to.
+pub async fn reset_for_contract(pool: &PgPool, contract: &str) -> Result<()> {
+    sqlx::raw_sql(
+        "TRUNCATE observations, candles, orders, conditionals, fills, liquidations, fee_claims, markets, indexer_state",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("INSERT INTO indexer_state (key, value) VALUES ('contract', $1)")
+        .bind(contract)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
