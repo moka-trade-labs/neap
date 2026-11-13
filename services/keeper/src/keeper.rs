@@ -46,7 +46,8 @@ async fn markets(rpc: &NearRpc, config: &Config) -> Vec<MarketInfo> {
     out
 }
 
-async fn update_price(rpc: &NearRpc, config: &Config, http: &reqwest::Client, m: &MarketInfo) {
+/// Returns true when a price was pushed (push_price already catches the engine up, so no crank needed).
+async fn update_price(rpc: &NearRpc, config: &Config, http: &reqwest::Client, m: &MarketInfo) -> bool {
     if m.pushed {
         let sym = config
             .price_feeds
@@ -67,15 +68,20 @@ async fn update_price(rpc: &NearRpc, config: &Config, http: &reqwest::Client, m:
         let px = px.or((config.push_price_e6 > 0).then_some(config.push_price_e6));
         if let Some(p) = px {
             match contract::push_price(rpc, m.id, p).await {
-                Ok(hash) => info!(market = m.id, sym, price_e6 = p, hash, "pushed price"),
+                Ok(hash) => {
+                    info!(market = m.id, sym, price_e6 = p, hash, "pushed price");
+                    return true;
+                }
                 Err(e) => warn!(market = m.id, err = %e, "push_price failed"),
             }
         }
+        false
     } else {
         match contract::refresh_price(rpc, m.id).await {
             Ok(hash) => info!(market = m.id, hash, "refresh_price sent"),
             Err(e) => warn!(market = m.id, err = %e, "refresh_price failed"),
         }
+        false
     }
 }
 
@@ -141,15 +147,17 @@ pub async fn tick(rpc: &NearRpc, config: &Config, http: &reqwest::Client, n: u64
         if m.mode == "WindDown" || m.mode == "Recovery" {
             continue;
         }
-        update_price(rpc, config, http, m).await;
+        let pushed = update_price(rpc, config, http, m).await;
         if m.mode == "Proposed" && m.seq > 0 {
             match rpc.call("activate_market", json!({ "market": m.id }), 0).await {
                 Ok(hash) => info!(market = m.id, hash, "activated market"),
                 Err(e) => debug!(market = m.id, err = %e, "activate_market refused"),
             }
         }
-        if let Err(e) = contract::crank(rpc, m.id).await {
-            warn!(market = m.id, err = %e, "crank failed");
+        if !pushed {
+            if let Err(e) = contract::crank(rpc, m.id).await {
+                warn!(market = m.id, err = %e, "crank failed");
+            }
         }
     }
     scan_and_execute(rpc, false).await;
