@@ -1,0 +1,9 @@
+target
+target-wasm
+**/target
+node_modules
+web
+docs
+.git
+.env
+.env.*
