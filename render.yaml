@@ -17,6 +17,8 @@ services:
         value: neap-oracle.testnet
       - key: NEAP_SIGNER_KEY
         sync: false # paste the oracle account's private key (ed25519:...) in the dashboard
+      - key: FASTNEAR_API_KEY
+        sync: false # free key from dashboard.fastnear.com; lifts RPC + neardata rate limits
       - key: NEAP_LOOP_MS
         value: "1000"
       - key: FAUCET_TOKEN

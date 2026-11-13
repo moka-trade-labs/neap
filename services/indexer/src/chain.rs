@@ -61,9 +61,13 @@ impl Chain {
     async fn view_on(&self, rpc_url: &str, method: &str, args: &Value) -> Result<Value> {
         use base64::Engine;
         let args_b64 = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(args)?);
-        let resp: Value = self
-            .client
-            .post(rpc_url)
+        let mut req = self.client.post(rpc_url);
+        if rpc_url.contains("fastnear") {
+            if let Some(k) = crate::config::fastnear_key() {
+                req = req.bearer_auth(k);
+            }
+        }
+        let resp: Value = req
             .json(&json!({
                 "jsonrpc": "2.0", "id": "idx", "method": "query",
                 "params": {

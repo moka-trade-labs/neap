@@ -224,7 +224,10 @@ impl NearRpc {
     /// (same hash, so a duplicate is harmless).
     async fn send_tx(&self, tx_b64: &str) -> Result<Value> {
         let n = self.rpc_urls.len().max(1);
-        let params = json!({ "signed_tx_base64": tx_b64, "wait_until": "EXECUTED_OPTIMISTIC" });
+        // INCLUDED returns in about a second, which free RPC plans tolerate. The
+        // keeper is idempotent, so a tx that later fails is simply retried next tick.
+        let wait = std::env::var("NEAP_TX_WAIT").unwrap_or_else(|_| "INCLUDED".to_string());
+        let params = json!({ "signed_tx_base64": tx_b64, "wait_until": wait });
         let mut last = anyhow!("no rpc configured");
         for _ in 0..n {
             let idx = self.rpc_idx.load(Ordering::Relaxed) % n;
@@ -265,7 +268,15 @@ impl NearRpc {
 
     async fn rpc_call_on(&self, url: &str, method: &str, params: &Value) -> std::result::Result<Value, (bool, anyhow::Error)> {
         let body = json!({ "jsonrpc": "2.0", "id": "keeper", "method": method, "params": params });
-        let resp = self.client.post(url).json(&body).send().await.map_err(|e| (true, e.into()))?;
+        let mut req = self.client.post(url).json(&body);
+        if url.contains("fastnear") {
+            if let Ok(k) = std::env::var("FASTNEAR_API_KEY") {
+                if !k.trim().is_empty() {
+                    req = req.bearer_auth(k.trim());
+                }
+            }
+        }
+        let resp = req.send().await.map_err(|e| (true, e.into()))?;
         let limited = resp.status().as_u16() == 429 || resp.status().is_server_error();
         let resp: Value = resp.json().await.map_err(|e| (true, e.into()))?;
         if let Some(err) = resp.get("error") {
@@ -275,6 +286,7 @@ impl NearRpc {
                 || es.contains("Rate limit")
                 || es.contains("rate limit")
                 || es.contains("-32601")
+                || es.contains("timeout")
                 || es.contains("not available");
             return Err((rotate, anyhow!("RPC error on {method}: {err}")));
         }

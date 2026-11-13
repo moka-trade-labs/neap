@@ -16,7 +16,11 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value> {
-    let resp = client.get(url).send().await?;
+    let mut req = client.get(url);
+    if let Some(k) = crate::config::fastnear_key() {
+        req = req.bearer_auth(k);
+    }
+    let resp = req.send().await?;
     let status = resp.status();
     if !status.is_success() {
         return Err(anyhow!("{url}: HTTP {status}"));

@@ -55,3 +55,8 @@ impl Config {
         })
     }
 }
+
+/// Optional FastNEAR API key (lifts the per-IP limits on their RPC and neardata).
+pub fn fastnear_key() -> Option<String> {
+    std::env::var("FASTNEAR_API_KEY").ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+}
