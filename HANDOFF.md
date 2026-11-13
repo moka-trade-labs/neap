@@ -157,3 +157,33 @@ Steps 1.7 (conditional orders), 1.8 (fees), 1.9 (admin roles) implemented. 48 te
 - Both tests pass. 48 unit tests + 2 sandbox tests all green.
 
 Next: 1.10 keeper (off-chain), 1.11 indexer + API, 1.12 security gate + mainnet deploy.
+
+## 2026-11-13: backend deployed (keeper + indexer + API), path 1 live on testnet
+
+Where things run and which accounts exist: `deploy/TESTNET.md`. API reference: `services/indexer/README.md`.
+
+What changed in the services:
+- Keeper runs three independent loops (price, orders, liquidations). Orders are picked up every second;
+  if the last observation is not newer than the request, the keeper asks for one first (push or
+  `refresh_price`) and then executes. Conditionals are only sent when the mark is within 0.3% of the trigger.
+- Keeper auto-discovers markets, pushes a live Coinbase/Kraken price to `Pushed` markets, calls
+  `refresh_price` on `NearPool` markets, and activates `Proposed` markets once they have an observation.
+- Indexer has two event paths: the neardata block feed (rate-limited from Render, treat as a backup) and
+  `POST /tx {hash, signer_id}`, which reads the transaction outcome over JSON-RPC. The keeper reports its own
+  transactions; the frontend must report each wallet transaction. Receipts are de-duplicated (`seen_receipts`).
+- Prices, market state and candles come from a 3 s `get_market` poll, not from events.
+- Transactions are sent with `wait_until: INCLUDED`, so a keeper log line "sent" does not prove success.
+
+Known gaps (not fixed, by priority):
+1. Liquidation scan is naive: it takes accounts from the indexer (`/accounts`, so only accounts whose
+   fills were indexed) and sends `liquidate` for every open position, relying on the contract to refuse.
+   Needs an account enumeration view or an off-chain health check.
+2. A user transaction the frontend never reports is only indexed if the block feed happens to work.
+   A FastNEAR API key (`FASTNEAR_API_KEY` in Render) makes the block feed reliable.
+3. `convert_pnl_for` does not exist, so the keeper cannot auto-convert profit on close (decision F-1).
+4. Permissionless `Pushed` markets cannot activate (only the owner path creates them); fine for path 1.
+5. `base_decimals` is lister-supplied and unchecked; a wrong value misprices the market.
+6. The first deployment's key is committed in `CONTRACT.md`. Rotate it and purge it before mainnet.
+7. Free Render instance and free Postgres (expires 2026-12-13); public RPCs with failover, no paid key.
+8. Path 2 (Solana tokens through a TEE oracle, opening and creating from Solana) is not started in the
+   services: `oracle-agent` and `relayer` are skeletons.
