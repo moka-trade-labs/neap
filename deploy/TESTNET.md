@@ -19,3 +19,14 @@ Keys are **not** in the repo. The oracle key lives only in Render (`NEAP_SIGNER_
 
 Ops without near-cli: `cargo run -p neap-ops -- <keygen|view|call|deploy|sub|transfer>` (see `services/ops/src/main.rs`).
 The previous deployment (`neap-trade.testnet`) is described in `CONTRACT.md`.
+
+## Path 1 demo: a NEAR token priced from a pool (2026-11-13)
+
+- Demo token `tide-token.testnet` (TIDE, 6 decimals, open `mint`).
+- Ref testnet pool: `ref-finance-101.testnet`, `pool_id` 2962, 100,000 TIDE / 250,000 test USDC ($2.50).
+- Market 1 `TIDE-PERP` was created through `ft_transfer_call` + `CreateMarket` (LongTail, 50 USDC bond,
+  `NearPool{dex, pool_id: 2962}`), activated by the keeper, seeded with 20,000 USDC of LP.
+- `CreateMarket` accepts `base_decimals` (default 6) so 8/18/24-decimal tokens price correctly.
+  The contract was upgraded in place (tx `ArZS8YRDZEHvqpXcRHdueJ6xu9XuzwrenQ9EykF7R5ux`); the value lives
+  under a raw storage key `bd:<market>`, so no state migration was needed. It is lister-supplied and
+  not checked against `ft_metadata`.
