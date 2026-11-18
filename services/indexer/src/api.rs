@@ -24,6 +24,8 @@ pub struct AppState {
     pub live: LiveMarkets,
     pub keeper_url: Option<String>,
     pub http: reqwest::Client,
+    /// Bounds concurrent POST /tx lookups.
+    pub ingest: Arc<tokio::sync::Semaphore>,
 }
 
 type S = State<Arc<AppState>>;
@@ -50,6 +52,7 @@ pub fn router(state: AppState) -> Router {
         .route("/account/{owner}/liquidations", get(get_account_liquidations))
         .route("/view/{method}", get(view_proxy))
         .route("/faucet", post(faucet))
+        .route("/tx", post(report_tx))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(Arc::new(state))
@@ -456,6 +459,29 @@ async fn view_proxy(State(s): S, Path(method): Path<String>, Query(q): Query<Vie
         Ok(v) => Json(v).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, e),
     }
+}
+
+// ── Report a transaction so its events are indexed right away ──
+
+async fn report_tx(State(s): S, Json(body): Json<Value>) -> Response {
+    let hash = body["hash"].as_str().unwrap_or("").trim().to_string();
+    let signer = body["signer_id"].as_str().unwrap_or("").trim().to_string();
+    let b58 = |x: &str| x.chars().all(|c| c.is_ascii_alphanumeric());
+    if !(32..=44).contains(&hash.len()) || !b58(&hash) || signer.is_empty() || signer.len() > 64 {
+        return err(StatusCode::BAD_REQUEST, "expected {hash, signer_id}");
+    }
+    let Ok(permit) = s.ingest.clone().try_acquire_owned() else {
+        return err(StatusCode::TOO_MANY_REQUESTS, "busy, retry shortly");
+    };
+    let s = s.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        match crate::ingest::ingest_tx(&s.chain, &s.pool, &s.tx, &hash, &signer).await {
+            Ok(n) => tracing::info!(hash, events = n, "transaction indexed"),
+            Err(e) => tracing::warn!(hash, err = %e, "transaction not indexed"),
+        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
 }
 
 // ── Faucet (forwarded to the keeper, which holds the signing key) ──

@@ -14,12 +14,15 @@ const CALL_GAS: Gas = 80_000_000_000_000; // 80 TGas
 
 pub struct NearRpc {
     client: reqwest::Client,
-    rpc_url: String,
+    rpc_urls: Vec<String>,
+    rpc_idx: std::sync::atomic::AtomicUsize,
     contract_id: AccountId,
     signer_id: AccountId,
     signer: InMemorySigner,
     nonce: AtomicU64,
     block_hash: std::sync::Mutex<CryptoHash>,
+    /// Indexer base URL: every state-changing contract tx hash is reported to it.
+    notify: Option<String>,
 }
 
 impl NearRpc {
@@ -42,16 +45,18 @@ impl NearRpc {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(8))
             .build()?;
         let rpc = Self {
             client,
-            rpc_url: rpc_url.to_string(),
+            rpc_urls: rpc_url.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect(),
+            rpc_idx: Default::default(),
             contract_id,
             signer_id: signer_account,
             signer,
             nonce: AtomicU64::new(0),
             block_hash: std::sync::Mutex::new(CryptoHash::default()),
+            notify: std::env::var("NEAP_INDEXER_URL").ok().filter(|s| !s.is_empty()),
         };
         rpc.refresh_access_key().await?;
         Ok(rpc)
@@ -84,7 +89,7 @@ impl NearRpc {
         );
         let resp = self.rpc_call("query", json!({
             "request_type": "call_function",
-            "finality": "final",
+            "finality": "optimistic",
             "account_id": self.contract_id.to_string(),
             "method_name": method,
             "args_base64": args_b64,
@@ -154,7 +159,7 @@ impl NearRpc {
             &tx_bytes,
         );
 
-        let resp = match self.rpc_call("broadcast_tx_commit", json!([tx_b64])).await {
+        let resp = match self.send_tx(&tx_b64).await {
             Ok(r) => r,
             Err(e) => {
                 // Nonce/blockhash problems: resync so the next call works.
@@ -172,6 +177,17 @@ impl NearRpc {
             .as_str()
             .unwrap_or("unknown")
             .to_string();
+        // Price updates are read from views; everything else carries events.
+        let quiet = matches!(method.as_str(), "push_price" | "refresh_price" | "crank");
+        if let (Some(base), false, true) = (&self.notify, quiet, receiver == &self.contract_id) {
+            let req = self
+                .client
+                .post(format!("{}/tx", base.trim_end_matches('/')))
+                .json(&json!({ "hash": hash, "signer_id": self.signer_id.to_string() }));
+            tokio::spawn(async move {
+                let _ = req.send().await;
+            });
+        }
         Ok(hash)
     }
 
@@ -193,7 +209,7 @@ impl NearRpc {
         let signature = self.signer.secret_key.sign(tx_hash.as_ref());
         let signed = near_primitives::transaction::SignedTransaction::new(signature, tx);
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, borsh::to_vec(&signed)?);
-        let resp = self.rpc_call("broadcast_tx_commit", json!([tx_b64])).await?;
+        let resp = self.send_tx(&tx_b64).await?;
         Ok(resp["transaction"]["hash"].as_str().unwrap_or("unknown").to_string())
     }
 
@@ -217,25 +233,82 @@ impl NearRpc {
         &self.signer_id
     }
 
+    /// Broadcast a signed tx and wait for execution. A rate-limited or
+    /// unsupported RPC rotates and the same signed tx is sent to the next one
+    /// (same hash, so a duplicate is harmless).
+    async fn send_tx(&self, tx_b64: &str) -> Result<Value> {
+        let n = self.rpc_urls.len().max(1);
+        // INCLUDED returns in about a second, which free RPC plans tolerate. The
+        // keeper is idempotent, so a tx that later fails is simply retried next tick.
+        let wait = std::env::var("NEAP_TX_WAIT").unwrap_or_else(|_| "INCLUDED".to_string());
+        let params = json!({ "signed_tx_base64": tx_b64, "wait_until": wait });
+        let mut last = anyhow!("no rpc configured");
+        for _ in 0..n {
+            let idx = self.rpc_idx.load(Ordering::Relaxed) % n;
+            match self.rpc_call_on(&self.rpc_urls[idx], "send_tx", &params).await {
+                Ok(v) => return Ok(v),
+                Err((true, e)) => {
+                    self.rpc_idx.store((idx + 1) % n, Ordering::Relaxed);
+                    last = e;
+                }
+                Err((false, e)) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
+    /// JSON-RPC call. Rate limits and transport errors rotate to the next
+    /// RPC; queries are retried there, transactions are not re-sent.
     pub async fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": "keeper",
-            "method": method,
-            "params": params,
-        });
-        let resp: Value = self.client
-            .post(&self.rpc_url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let n = self.rpc_urls.len().max(1);
+        let tries = if method == "query" { n } else { 1 };
+        let mut last = anyhow!("no rpc configured");
+        for _ in 0..tries {
+            let idx = self.rpc_idx.load(Ordering::Relaxed) % n;
+            match self.rpc_call_on(&self.rpc_urls[idx], method, &params).await {
+                Ok(v) => return Ok(v),
+                Err((rotate, e)) => {
+                    if rotate {
+                        self.rpc_idx.store((idx + 1) % n, Ordering::Relaxed);
+                    } else {
+                        return Err(e);
+                    }
+                    last = e;
+                }
+            }
+        }
+        Err(last)
+    }
+
+    async fn rpc_call_on(&self, url: &str, method: &str, params: &Value) -> std::result::Result<Value, (bool, anyhow::Error)> {
+        let body = json!({ "jsonrpc": "2.0", "id": "keeper", "method": method, "params": params });
+        let mut req = self.client.post(url).json(&body);
+        if url.contains("fastnear") {
+            if let Ok(k) = std::env::var("FASTNEAR_API_KEY") {
+                if !k.trim().is_empty() {
+                    req = req.bearer_auth(k.trim());
+                }
+            }
+        }
+        let resp = req.send().await.map_err(|e| (true, e.into()))?;
+        let limited = resp.status().as_u16() == 429 || resp.status().is_server_error();
+        let resp: Value = resp.json().await.map_err(|e| (true, e.into()))?;
         if let Some(err) = resp.get("error") {
-            return Err(anyhow!("RPC error on {method}: {err}"));
+            let es = err.to_string();
+            let rotate = limited
+                || es.contains("429")
+                || es.contains("Rate limit")
+                || es.contains("rate limit")
+                || es.contains("-32601")
+                || es.contains("timeout")
+                || es.contains("not available");
+            return Err((rotate, anyhow!("RPC error on {method}: {err}")));
+        }
+        if limited {
+            return Err((true, anyhow!("RPC {url} unavailable for {method}")));
         }
         resp.get("result")
             .cloned()
-            .ok_or_else(|| anyhow!("no result in RPC response for {method}"))
+            .ok_or_else(|| (true, anyhow!("no result in RPC response for {method}")))
     }
 }

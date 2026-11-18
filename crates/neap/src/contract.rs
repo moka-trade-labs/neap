@@ -104,6 +104,9 @@ enum FtMsg {
         spread_bps: u64,
         max_oracle_age_ns: U64,
         params: MarketParamsJson,
+        /// Decimals of the base token in a `NearPool` source (default 6).
+        #[serde(default)]
+        base_decimals: Option<u8>,
     },
 }
 
@@ -395,7 +398,13 @@ impl Neap {
                 spread_bps,
                 max_oracle_age_ns,
                 params,
+                base_decimals,
             } => {
+                let base_decimals = base_decimals.unwrap_or(6);
+                require!(
+                    base_decimals <= policy::MAX_BASE_DECIMALS,
+                    "base_decimals too large"
+                );
                 // Step 1.4: permissionless market creation with bond.
                 let min_bond = match tier {
                     Tier::Major => 0,    // protocol-listed majors don't need a bond
@@ -408,6 +417,7 @@ impl Neap {
                 require!(spread_bps <= policy::MAX_SPREAD_BPS, "spread too wide");
                 let id = self.markets.len();
                 let gid = self.group_id(id);
+                Self::set_base_decimals(id, base_decimals);
                 // Initial price of 0 — it will be set by the first observation.
                 // For NearPool markets the engine is seeded with price=1 (placeholder)
                 // and the real price arrives via refresh_price → on_price_read.
@@ -846,11 +856,13 @@ impl Neap {
             return;
         }
         // price_e6 = usdc_atoms * 10^base_decimals / token_atoms
-        // Assuming 6-decimal tokens for MVP; the base_decimals field can be
-        // added to PriceSource::NearPool when tokens with other decimals land.
-        let price_e6 = match u64::try_from(usdc_atoms * 1_000_000 / token_atoms) {
-            Ok(p) if p > 0 && p <= policy::MAX_PRICE => p,
-            _ => return,
+        let price_e6 = match policy::pool_price_e6(
+            usdc_atoms,
+            token_atoms,
+            Self::base_decimals(market),
+        ) {
+            Some(p) => p,
+            None => return,
         };
         let liquidity_usd = usdc_atoms; // conservative: quote-side reserve only
 
@@ -906,6 +918,29 @@ impl Neap {
                 "seq": info.observation.seq.to_string(),
             }),
         );
+    }
+
+    // Base-token decimals per NearPool market. Kept under its own raw storage
+    // key so existing `Market` records keep their layout (no migration).
+    fn base_decimals_key(market: u32) -> Vec<u8> {
+        let mut k = b"bd:".to_vec();
+        k.extend_from_slice(&market.to_le_bytes());
+        k
+    }
+
+    fn set_base_decimals(market: u32, decimals: u8) {
+        env::storage_write(&Self::base_decimals_key(market), &[decimals]);
+    }
+
+    fn base_decimals(market: u32) -> u8 {
+        env::storage_read(&Self::base_decimals_key(market))
+            .and_then(|v| v.first().copied())
+            .unwrap_or(6)
+    }
+
+    /// View: decimals of the base token the pool reader assumes for `market`.
+    pub fn get_base_decimals(&self, market: u32) -> u8 {
+        Self::base_decimals(market)
     }
 
     // ─────────────────────── 1.4: permissionless markets ──────────────────

@@ -10,7 +10,8 @@ use tracing::warn;
 #[derive(Clone)]
 pub struct Chain {
     client: reqwest::Client,
-    rpc_url: String,
+    rpc_urls: Vec<String>,
+    next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     contract_id: String,
 }
 
@@ -21,7 +22,8 @@ impl Chain {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),
-            rpc_url: rpc_url.to_string(),
+            rpc_urls: rpc_url.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect(),
+            next: Default::default(),
             contract_id: contract_id.to_string(),
         }
     }
@@ -30,13 +32,69 @@ impl Chain {
         &self.contract_id
     }
 
+    /// Any JSON-RPC method, tried on each RPC in turn.
+    pub async fn rpc(&self, method: &str, params: &Value) -> Result<Value> {
+        use std::sync::atomic::Ordering;
+        let n = self.rpc_urls.len().max(1);
+        let start = self.next.load(Ordering::Relaxed);
+        let mut last = anyhow!("no rpc configured");
+        for i in 0..n {
+            let url = &self.rpc_urls[(start + i) % n];
+            let mut req = self.client.post(url);
+            if url.contains("fastnear") {
+                if let Some(k) = crate::config::fastnear_key() {
+                    req = req.bearer_auth(k);
+                }
+            }
+            let body = json!({ "jsonrpc": "2.0", "id": "idx", "method": method, "params": params });
+            let resp: Result<Value> = async { Ok(req.json(&body).send().await?.json().await?) }.await;
+            match resp {
+                Ok(v) => match v.get("result") {
+                    Some(r) if v.get("error").is_none() => return Ok(r.clone()),
+                    _ => last = anyhow!("rpc error on {method}: {}", v["error"]),
+                },
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
     /// Call a view method on the neap contract and parse its JSON result.
+    /// Tries each RPC in turn (starting with the last one that worked).
     pub async fn view(&self, method: &str, args: &Value) -> Result<Value> {
+        use std::sync::atomic::Ordering;
+        let n = self.rpc_urls.len().max(1);
+        let start = self.next.load(Ordering::Relaxed);
+        let mut last = anyhow!("no rpc configured");
+        for i in 0..n {
+            let idx = (start + i) % n;
+            match self.view_on(&self.rpc_urls[idx], method, args).await {
+                Ok(v) => {
+                    self.next.store(idx, Ordering::Relaxed);
+                    return Ok(v);
+                }
+                Err(e) => {
+                    // A contract-level error is the same on every RPC.
+                    if e.to_string().starts_with("view error") {
+                        return Err(e);
+                    }
+                    last = e;
+                }
+            }
+        }
+        Err(last)
+    }
+
+    async fn view_on(&self, rpc_url: &str, method: &str, args: &Value) -> Result<Value> {
         use base64::Engine;
         let args_b64 = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(args)?);
-        let resp: Value = self
-            .client
-            .post(&self.rpc_url)
+        let mut req = self.client.post(rpc_url);
+        if rpc_url.contains("fastnear") {
+            if let Some(k) = crate::config::fastnear_key() {
+                req = req.bearer_auth(k);
+            }
+        }
+        let resp: Value = req
             .json(&json!({
                 "jsonrpc": "2.0", "id": "idx", "method": "query",
                 "params": {
@@ -52,6 +110,10 @@ impl Chain {
             .json()
             .await?;
         if let Some(err) = resp.get("error") {
+            let es = err.to_string();
+            if es.contains("FunctionCallError") || es.contains("MethodNotFound") || es.contains("CONTRACT_EXECUTION_ERROR") {
+                return Err(anyhow!("view error: {err}"));
+            }
             return Err(anyhow!("rpc error: {err}"));
         }
         if let Some(err) = resp["result"].get("error") {
@@ -108,6 +170,10 @@ async fn refresh_once(
             if let Err(e) = crate::db::upsert_market_from_view(pool, id as i32, &v).await {
                 warn!(market = id, err = %e, "market upsert failed");
             }
+        }
+        let _ = crate::db::ensure_market(pool, id as i32).await;
+        if let Err(e) = crate::db::upsert_observation_from_view(pool, id as i32, &v).await {
+            warn!(market = id, err = %e, "observation upsert failed");
         }
         let _ = tx.send(json!({ "event": "market_state", "data": v }).to_string());
         out.push(v);
