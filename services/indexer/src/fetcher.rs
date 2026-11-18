@@ -109,10 +109,21 @@ pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) ->
     let base = config.neardata_url.trim_end_matches('/').to_string();
     let interval = std::time::Duration::from_millis(config.poll_interval_ms);
 
-    // A different contract than last run: the stored rows belong to the old one.
-    if db::get_state(&pool, "contract").await?.as_deref() != Some(config.contract_id.as_str()) {
-        db::reset_for_contract(&pool, &config.contract_id).await?;
-        info!(contract = %config.contract_id, "contract changed, indexer tables reset");
+    // A different contract than last run: the stored rows belong to the old
+    // one. Wiping them takes an explicit switch, so a typo in NEAP_CONTRACT
+    // cannot erase history that the block feed can no longer replay.
+    match db::get_state(&pool, "contract").await?.as_deref() {
+        Some(c) if c == config.contract_id => {}
+        Some(old) if std::env::var("RESET_ON_CONTRACT_CHANGE").as_deref() != Ok("1") => {
+            return Err(anyhow!(
+                "database holds data for {old}, not {}; set RESET_ON_CONTRACT_CHANGE=1 to wipe it",
+                config.contract_id
+            ));
+        }
+        _ => {
+            db::reset_for_contract(&pool, &config.contract_id).await?;
+            info!(contract = %config.contract_id, "indexer tables reset for this contract");
+        }
     }
 
     let head = loop {

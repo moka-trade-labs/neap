@@ -132,19 +132,30 @@ impl Chain {
 /// Latest `get_market` view per market id (index = market id).
 pub type LiveMarkets = Arc<RwLock<Vec<Value>>>;
 
+/// Unix ms of the last complete poll (0 = never).
+pub type LiveAt = Arc<std::sync::atomic::AtomicU64>;
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Poll every market's view, keep the cache warm, upsert static fields into
 /// Postgres, and broadcast a `market_state` WS message per market.
 pub async fn run_live_poller(
     chain: Chain,
     pool: PgPool,
     live: LiveMarkets,
+    live_at: LiveAt,
     tx: broadcast::Sender<String>,
     every: std::time::Duration,
 ) {
     let mut n: u64 = 0;
     loop {
         match refresh_once(&chain, &pool, &live, &tx, n % 20 == 0).await {
-            Ok(()) => {}
+            Ok(()) => live_at.store(now_ms(), std::sync::atomic::Ordering::Relaxed),
             Err(e) => warn!(err = %e, "live market refresh failed"),
         }
         n += 1;
@@ -159,12 +170,32 @@ async fn refresh_once(
     tx: &broadcast::Sender<String>,
     write_db: bool,
 ) -> Result<()> {
-    let count = chain.view("get_markets_count", &json!({})).await?.as_u64().unwrap_or(0);
+    // An unreadable count must not be mistaken for "no markets".
+    let count = chain
+        .view("get_markets_count", &json!({}))
+        .await?
+        .as_u64()
+        .context("get_markets_count returned no number")?;
+    let previous = live.read().await.clone();
     let mut out = Vec::with_capacity(count as usize);
     for id in 0..count {
-        let mut v = chain.view("get_market", &json!({ "market": id })).await?;
+        let mut v = match chain.view("get_market", &json!({ "market": id })).await {
+            Ok(v) if v.is_object() => v,
+            other => {
+                // One unreadable market must not freeze the others: keep its
+                // last known state (its `fetched_at_ms` shows the age).
+                let why = other.err().map(|e| e.to_string()).unwrap_or_else(|| "empty view".into());
+                warn!(market = id, why, "get_market failed, keeping the previous state");
+                if let Some(old) = previous.get(id as usize) {
+                    out.push(old.clone());
+                    continue;
+                }
+                return Err(anyhow!("market {id} unreadable and never seen: {why}"));
+            }
+        };
         if let Value::Object(ref mut o) = v {
             o.insert("id".into(), json!(id));
+            o.insert("fetched_at_ms".into(), json!(now_ms()));
         }
         if write_db {
             if let Err(e) = crate::db::upsert_market_from_view(pool, id as i32, &v).await {

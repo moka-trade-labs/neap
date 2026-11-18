@@ -520,3 +520,108 @@ pub async fn record_skipped(pool: &PgPool, from_block: u64, to_block: u64) -> Re
         .await?;
     Ok(())
 }
+
+/// Database scenarios. They need a Postgres to write to and are skipped
+/// unless `TEST_DATABASE_URL` is set (CI sets it; see .github/workflows).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ev(event: &str, data: serde_json::Value) -> NeapEvent {
+        NeapEvent { event: event.to_string(), data }
+    }
+
+    async fn status(pool: &PgPool, table: &str, id: i64) -> Option<String> {
+        sqlx::query_as::<_, (String,)>(&format!("SELECT status FROM {table} WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .map(|(s,)| s)
+    }
+
+    async fn count(pool: &PgPool, sql: &str) -> i64 {
+        sqlx::query_as::<_, (i64,)>(sql).fetch_one(pool).await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn receipts_are_atomic_and_order_independent() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("TEST_DATABASE_URL not set, skipping database scenarios");
+            return;
+        };
+        let pool = PgPool::connect(&url).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/001_init.sql")).execute(&pool).await.unwrap();
+        reset_for_contract(&pool, "test.testnet").await.unwrap();
+        let ts = chrono::Utc::now();
+
+        let request = ev("order_requested", json!({
+            "id": "7", "market": 0, "owner": "alice.testnet", "side": "Long",
+            "size_q": "1000", "limit_price": "5000000",
+        }));
+        let fill = ev("fill", json!({
+            "market": 0, "owner": "alice.testnet", "order_id": "7",
+            "size_q": "1000", "price": "5010000", "fee": "25",
+        }));
+
+        // 1. The keeper's fill is indexed before the user's request (the two
+        //    delivery paths are independent). The order must end up filled.
+        assert!(index_receipt(&pool, "r-fill", &[&fill], 10, ts).await.unwrap());
+        assert!(index_receipt(&pool, "r-request", &[&request], 9, ts).await.unwrap());
+        assert_eq!(status(&pool, "orders", 7).await.as_deref(), Some("filled"));
+        let owner: (String, String) = sqlx::query_as("SELECT owner, side FROM orders WHERE id = 7")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(owner, ("alice.testnet".to_string(), "Long".to_string()));
+
+        // 2. The same receipt from the other path is ignored: one fill, not two.
+        assert!(!index_receipt(&pool, "r-fill", &[&fill], 10, ts).await.unwrap());
+        assert_eq!(count(&pool, "SELECT count(*) FROM fills WHERE order_id = 7").await, 1);
+
+        // 3. A cancel that arrives before its request keeps the order cancelled.
+        let cancel = ev("order_cancelled", json!({ "id": "8", "market": 0 }));
+        let request8 = ev("order_requested", json!({
+            "id": "8", "market": 0, "owner": "bob.testnet", "side": "Short",
+            "size_q": "5", "limit_price": "1",
+        }));
+        index_receipt(&pool, "r-cancel", &[&cancel], 11, ts).await.unwrap();
+        index_receipt(&pool, "r-request8", &[&request8], 10, ts).await.unwrap();
+        assert_eq!(status(&pool, "orders", 8).await.as_deref(), Some("cancelled"));
+
+        // 4. A receipt whose second event cannot be written leaves nothing
+        //    behind, not even the seen_receipts row, so it can be retried.
+        let good = ev("order_requested", json!({
+            "id": "9", "market": 0, "owner": "carol.testnet", "side": "Long",
+            "size_q": "1", "limit_price": "1",
+        }));
+        // Postgres refuses a NUL byte in text: this insert fails in the database.
+        let poison = ev("liquidation", json!({ "market": 0, "account": "x\u{0}", "caller": "y" }));
+        assert!(index_receipt(&pool, "r-poison", &[&good, &poison], 12, ts).await.is_err());
+        assert_eq!(status(&pool, "orders", 9).await, None);
+        assert_eq!(count(&pool, "SELECT count(*) FROM seen_receipts WHERE receipt_id = 'r-poison'").await, 0);
+        assert!(index_receipt(&pool, "r-poison", &[&good], 12, ts).await.unwrap(), "retry succeeds");
+
+        // 5. A triggered conditional shows up in trade history.
+        let placed = ev("conditional_placed", json!({
+            "id": "20", "market": 0, "owner": "alice.testnet", "kind": "TakeProfit",
+            "side": "Short", "size_q": "1000", "trigger_price": "6000000",
+        }));
+        let triggered = ev("conditional_triggered", json!({
+            "id": "20", "market": 0, "owner": "alice.testnet", "kind": "TakeProfit",
+            "fill_price": "6000100", "size_q": "1000", "fee": "30",
+        }));
+        index_receipt(&pool, "r-placed", &[&placed], 13, ts).await.unwrap();
+        index_receipt(&pool, "r-trig", &[&triggered], 14, ts).await.unwrap();
+        assert_eq!(status(&pool, "conditionals", 20).await.as_deref(), Some("triggered"));
+        let f: (String, i64) = sqlx::query_as("SELECT side, price FROM fills WHERE order_id = 20")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(f, ("Short".to_string(), 6_000_100));
+
+        // 6. The candle query's time bound is valid SQL and returns the bucket.
+        sqlx::query("INSERT INTO observations (market_id, price_e6, seq, block, ts) VALUES (0, 5000000, 1, 1, now())")
+            .execute(&pool).await.unwrap();
+        let n = count(&pool,
+            "SELECT count(*) FROM observations WHERE market_id = 0 AND ts >= now() - make_interval(secs => 60::float8 * (300::bigint + 1))").await;
+        assert_eq!(n, 1);
+    }
+}

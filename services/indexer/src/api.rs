@@ -1,9 +1,11 @@
 //! REST + WebSocket API (axum). See services/indexer/README.md for the reference.
 
-use crate::chain::{Chain, LiveMarkets};
+use crate::chain::{now_ms, Chain, LiveAt, LiveMarkets};
+use crate::limit::{client_ip, is_account_id, Limiter, ViewCache};
 use axum::{
-    extract::{ws::Message, ConnectInfo, Path, Query, State, WebSocketUpgrade},
-    http::{HeaderMap, StatusCode},
+    extract::{ws::Message, ConnectInfo, Path, Query, Request, State, WebSocketUpgrade},
+    http::{HeaderMap, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -26,12 +28,108 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Bounds concurrent POST /tx lookups.
     pub ingest: Arc<tokio::sync::Semaphore>,
+    pub live_at: LiveAt,
+    pub guards: Arc<Guards>,
+}
+
+/// Abuse limits. The API is public and unauthenticated, runs on one small
+/// instance, and shares its RPC quota with the keeper that pushes prices.
+pub struct Guards {
+    /// Routes that call an RPC per request (`/account/:owner`, `/view`, `/quote`).
+    chain: Limiter,
+    /// `POST /tx` and `POST /faucet`.
+    write: Limiter,
+    /// Everything else (database reads).
+    read: Limiter,
+    views: ViewCache,
+    stats: std::sync::Mutex<Option<(std::time::Instant, Arc<Vec<Stats24>>)>>,
+    /// Transactions being looked up right now, so one hash is not fetched twice.
+    in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    ws: Arc<tokio::sync::Semaphore>,
+    trusted_hops: Option<usize>,
+}
+
+impl Guards {
+    pub fn from_env() -> Self {
+        let n = |key: &str, default: u32| std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        Self {
+            chain: Limiter::per_minute(n("API_CHAIN_PER_MIN", 120)),
+            write: Limiter::per_minute(n("API_WRITE_PER_MIN", 30)),
+            read: Limiter::per_minute(n("API_READ_PER_MIN", 600)),
+            views: ViewCache::new(std::time::Duration::from_millis(n("API_VIEW_CACHE_MS", 2000) as u64)),
+            stats: Default::default(),
+            in_flight: Default::default(),
+            ws: Arc::new(tokio::sync::Semaphore::new(n("WS_MAX_CONNECTIONS", 500) as usize)),
+            trusted_hops: std::env::var("TRUSTED_PROXY_HOPS").ok().and_then(|v| v.parse().ok()),
+        }
+    }
+}
+
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Per-client rate limit and a request deadline for every route.
+async fn guard(
+    State(s): S,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let xff = req.headers().get("x-forwarded-for").and_then(|h| h.to_str().ok());
+    // The keeper reports its transactions over loopback with no proxy in between.
+    let internal = addr.ip().is_loopback() && xff.is_none();
+    if !internal {
+        let ip = client_ip(xff, addr.ip(), s.guards.trusted_hops);
+        let path = req.uri().path();
+        let limiter = if req.method() == Method::POST {
+            &s.guards.write
+        } else if path.starts_with("/view/") || path.ends_with("/quote") || is_live_account(path) {
+            &s.guards.chain
+        } else {
+            &s.guards.read
+        };
+        if !limiter.allow(&ip, std::time::Instant::now()) {
+            return err(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded, slow down");
+        }
+    }
+    // The WebSocket upgrade returns at once; the socket itself is not timed.
+    match tokio::time::timeout(REQUEST_TIMEOUT, next.run(req)).await {
+        Ok(r) => r,
+        Err(_) => err(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
+    }
+}
+
+/// `/account/:owner` (live chain read), not its history sub-routes.
+fn is_live_account(path: &str) -> bool {
+    path.strip_prefix("/account/").map(|rest| !rest.is_empty() && !rest.contains('/')).unwrap_or(false)
+}
+
+/// What to tell a caller about a failed chain read. Contract-level errors are
+/// useful to the frontend; transport errors can carry provider URLs and keys.
+fn chain_err(e: anyhow::Error) -> Response {
+    let text = e.to_string();
+    if text.starts_with("view error") {
+        return err(StatusCode::BAD_REQUEST, text);
+    }
+    tracing::warn!(err = %text, "chain read failed");
+    err(StatusCode::BAD_GATEWAY, "NEAR RPC unavailable, try again shortly")
+}
+
+/// A contract view through the short-lived cache.
+async fn cached_view(s: &AppState, method: &str, args: &Value) -> anyhow::Result<Value> {
+    let key = format!("{method}:{args}");
+    let now = std::time::Instant::now();
+    if let Some(v) = s.guards.views.get(&key, now) {
+        return Ok(v);
+    }
+    let v = s.chain.view(method, args).await?;
+    s.guards.views.put(key, v.clone(), now);
+    Ok(v)
 }
 
 type S = State<Arc<AppState>>;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/config", get(config))
@@ -53,9 +151,11 @@ pub fn router(state: AppState) -> Router {
         .route("/view/{method}", get(view_proxy))
         .route("/faucet", post(faucet))
         .route("/tx", post(report_tx))
-        .route("/ws", get(ws_handler))
+        .route("/ws", get(ws_handler));
+    let state = Arc::new(state);
+    app.layer(middleware::from_fn_with_state(state.clone(), guard))
         .layer(CorsLayer::permissive())
-        .with_state(Arc::new(state))
+        .with_state(state)
 }
 
 fn err(code: StatusCode, msg: impl ToString) -> Response {
@@ -100,18 +200,68 @@ async fn root() -> impl IntoResponse {
     }))
 }
 
+/// Always HTTP 200 while the process serves requests (the host's health
+/// check restarts the container on anything else, which cannot fix a
+/// rate-limited RPC). `status` and `problems` say whether the data is fresh;
+/// point an uptime monitor at `status == "ok"`.
 async fn health(State(s): S) -> Response {
-    let last_block: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM indexer_state WHERE key = 'last_block'")
+    let mut problems: Vec<String> = Vec::new();
+    let last_block: Option<String> =
+        match sqlx::query_as::<_, (String,)>("SELECT value FROM indexer_state WHERE key = 'last_block'")
             .fetch_optional(&s.pool)
             .await
-            .unwrap_or(None);
+        {
+            Ok(r) => r.map(|(v,)| v),
+            Err(_) => {
+                problems.push("database unreachable".into());
+                None
+            }
+        };
+    let skipped: i64 = sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM skipped_ranges")
+        .fetch_one(&s.pool)
+        .await
+        .map(|(n,)| n)
+        .unwrap_or(0);
     let markets = s.live.read().await.len();
+    let live_at = s.live_at.load(std::sync::atomic::Ordering::Relaxed);
+    let live_age_ms = (live_at > 0).then(|| now_ms().saturating_sub(live_at));
+    match live_age_ms {
+        None => problems.push("market state never loaded".into()),
+        Some(age) if age > 15_000 => problems.push(format!("market state is {} s old", age / 1000)),
+        _ => {}
+    }
+    // The keeper runs beside the indexer; its status is the only place a
+    // stalled price feed or an empty gas account becomes visible.
+    let mut keeper = Value::Null;
+    if let Some(base) = &s.keeper_url {
+        let r = s
+            .http
+            .get(format!("{}/status", base.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await;
+        match r {
+            Ok(r) if r.status().is_success() => keeper = r.json().await.unwrap_or(Value::Null),
+            _ => problems.push("keeper not answering".into()),
+        }
+        let now = keeper["now_ms"].as_u64().unwrap_or(0);
+        for m in keeper["markets"].as_array().into_iter().flatten() {
+            let stuck = now.saturating_sub(m["advanced_at_ms"].as_u64().unwrap_or(now));
+            if m["mode"] == "Active" && stuck > 30_000 {
+                problems.push(format!("market {} price has not updated for {} s", m["id"], stuck / 1000));
+            }
+        }
+    }
     Json(json!({
         "ok": true,
+        "status": if problems.is_empty() { "ok" } else { "degraded" },
+        "problems": problems,
         "contract": s.chain.contract_id(),
-        "last_indexed_block": last_block.map(|(v,)| v),
+        "last_indexed_block": last_block,
+        "skipped_ranges": skipped,
         "live_markets": markets,
+        "live_age_ms": live_age_ms,
+        "keeper": keeper,
         "faucet": s.keeper_url.is_some(),
     }))
     .into_response()
@@ -135,7 +285,7 @@ async fn config(State(s): S) -> Response {
 // ── Markets ──
 
 #[derive(sqlx::FromRow)]
-struct Stats24 {
+pub struct Stats24 {
     market_id: i32,
     last_price: Option<i64>,
     open_24h: Option<i64>,
@@ -144,7 +294,20 @@ struct Stats24 {
     trades_24h: Option<i64>,
 }
 
-async fn stats_24h(pool: &PgPool) -> Vec<Stats24> {
+/// 24h stats for every market, recomputed at most every five seconds.
+async fn stats_24h(s: &AppState) -> Arc<Vec<Stats24>> {
+    let now = std::time::Instant::now();
+    if let Some((at, v)) = s.guards.stats.lock().unwrap().as_ref() {
+        if now.duration_since(*at) < std::time::Duration::from_secs(5) {
+            return v.clone();
+        }
+    }
+    let fresh = Arc::new(query_stats_24h(&s.pool).await);
+    *s.guards.stats.lock().unwrap() = Some((now, fresh.clone()));
+    fresh
+}
+
+async fn query_stats_24h(pool: &PgPool) -> Vec<Stats24> {
     sqlx::query_as::<_, Stats24>(
         "WITH o AS (
             SELECT market_id, price_e6, block FROM observations WHERE ts > now() - interval '24 hours'
@@ -181,7 +344,7 @@ fn merge_stats(mut v: Value, st: Option<&Stats24>) -> Value {
 
 async fn list_markets(State(s): S) -> Response {
     let live = s.live.read().await.clone();
-    let stats = stats_24h(&s.pool).await;
+    let stats = stats_24h(&s).await;
     let out: Vec<Value> = live
         .into_iter()
         .enumerate()
@@ -194,7 +357,7 @@ async fn get_market(State(s): S, Path(id): Path<u32>) -> Response {
     let cached = s.live.read().await.get(id as usize).cloned();
     let v = match cached {
         Some(v) => v,
-        None => match s.chain.view("get_market", &json!({ "market": id })).await {
+        None => match cached_view(&s, "get_market", &json!({ "market": id })).await {
             Ok(mut v) => {
                 if let Value::Object(ref mut o) = v {
                     o.insert("id".into(), json!(id));
@@ -204,7 +367,7 @@ async fn get_market(State(s): S, Path(id): Path<u32>) -> Response {
             Err(_) => return err(StatusCode::NOT_FOUND, "no such market"),
         },
     };
-    let stats = stats_24h(&s.pool).await;
+    let stats = stats_24h(&s).await;
     Json(merge_stats(v, stats.iter().find(|x| x.market_id == id as i32))).into_response()
 }
 
@@ -232,7 +395,8 @@ async fn get_candles(State(s): S, Path(id): Path<i32>, Query(q): Query<CandleQue
                   count(*) AS samples
            FROM (SELECT id, price_e6, block,
                         to_timestamp(floor(extract(epoch FROM ts) / $2) * $2) AS b
-                 FROM observations WHERE market_id = $1) t
+                 FROM observations
+                 WHERE market_id = $1 AND ts >= now() - make_interval(secs => $2 * ($3 + 1))) t
            GROUP BY b ORDER BY b DESC LIMIT $3
          ) c ORDER BY time ASC",
     )
@@ -368,7 +532,7 @@ list_handler!(get_account_liquidations, LiqRow, LIQ_COLS, "liquidations", "accou
 /// Every account the indexer has seen trade (the keeper's liquidation scan list).
 async fn list_accounts(State(s): S) -> Response {
     sqlx::query_as::<_, (String, i32)>(
-        "SELECT DISTINCT owner, market_id FROM orders
+        "SELECT DISTINCT owner, market_id FROM orders WHERE owner <> ''
          UNION SELECT DISTINCT owner, market_id FROM fills
          UNION SELECT DISTINCT owner, market_id FROM conditionals",
     )
@@ -389,24 +553,23 @@ async fn list_accounts(State(s): S) -> Response {
 
 /// Wallet balance plus the live position in every market.
 async fn get_account(State(s): S, Path(owner): Path<String>) -> Response {
-    let wallet = s
-        .chain
-        .view("get_wallet", &json!({ "account": owner }))
-        .await
-        .unwrap_or(Value::Null);
+    if !is_account_id(&owner) {
+        return err(StatusCode::BAD_REQUEST, "not a NEAR account id");
+    }
+    let wallet = cached_view(&s, "get_wallet", &json!({ "account": owner })).await.unwrap_or(Value::Null);
     let n = s.live.read().await.len();
+    // One market after another would hold the request for seconds: read them together.
+    let reads = (0..n).map(|m| {
+        let (s, owner) = (&s, &owner);
+        async move {
+            let args = json!({ "market": m, "account": owner });
+            let (acc, lp) =
+                tokio::join!(cached_view(s, "get_account", &args), cached_view(s, "get_lp_shares", &args));
+            (m, acc.unwrap_or(Value::Null), lp.unwrap_or(Value::Null))
+        }
+    });
     let mut positions = Vec::new();
-    for m in 0..n {
-        let acc = s
-            .chain
-            .view("get_account", &json!({ "market": m, "account": owner }))
-            .await
-            .unwrap_or(Value::Null);
-        let lp = s
-            .chain
-            .view("get_lp_shares", &json!({ "market": m, "account": owner }))
-            .await
-            .unwrap_or(Value::Null);
+    for (m, acc, lp) in futures::future::join_all(reads).await {
         if !acc.is_null() || lp.as_str().map(|x| x != "0").unwrap_or(false) {
             positions.push(json!({ "market": m, "account": acc, "lp_shares": lp }));
         }
@@ -421,17 +584,16 @@ struct QuoteQuery {
 }
 
 async fn get_quote(State(s): S, Path(id): Path<u32>, Query(q): Query<QuoteQuery>) -> Response {
-    match s
-        .chain
-        .view("quote", &json!({ "market": id, "side": q.side, "size_q": q.size_q }))
-        .await
-    {
+    if q.size_q.len() > 40 || !q.size_q.bytes().all(|b| b.is_ascii_digit()) || !matches!(q.side.as_str(), "Long" | "Short") {
+        return err(StatusCode::BAD_REQUEST, "side must be Long or Short and size_q a positive integer");
+    }
+    match cached_view(&s, "quote", &json!({ "market": id, "side": q.side, "size_q": q.size_q })).await {
         Ok(Value::Array(a)) if a.len() == 3 => Json(json!({
             "exec_price": a[0], "spread_bps": a[1], "fee": a[2]
         }))
         .into_response(),
         Ok(v) => Json(v).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e),
+        Err(e) => chain_err(e),
     }
 }
 
@@ -455,9 +617,12 @@ async fn view_proxy(State(s): S, Path(method): Path<String>, Query(q): Query<Vie
         Ok(v) => v.unwrap_or_else(|| json!({})),
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("args must be JSON: {e}")),
     };
-    match s.chain.view(&method, &args).await {
+    if q.args.as_deref().map(str::len).unwrap_or(0) > 512 {
+        return err(StatusCode::BAD_REQUEST, "args too long");
+    }
+    match cached_view(&s, &method, &args).await {
         Ok(v) => Json(v).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e),
+        Err(e) => chain_err(e),
     }
 }
 
@@ -467,10 +632,15 @@ async fn report_tx(State(s): S, Json(body): Json<Value>) -> Response {
     let hash = body["hash"].as_str().unwrap_or("").trim().to_string();
     let signer = body["signer_id"].as_str().unwrap_or("").trim().to_string();
     let b58 = |x: &str| x.chars().all(|c| c.is_ascii_alphanumeric());
-    if !(32..=44).contains(&hash.len()) || !b58(&hash) || signer.is_empty() || signer.len() > 64 {
+    if !(32..=44).contains(&hash.len()) || !b58(&hash) || !is_account_id(&signer) {
         return err(StatusCode::BAD_REQUEST, "expected {hash, signer_id}");
     }
+    // The same hash reported twice (page reload, retry) is looked up once.
+    if !s.guards.in_flight.lock().unwrap().insert(hash.clone()) {
+        return (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response();
+    }
     let Ok(permit) = s.ingest.clone().try_acquire_owned() else {
+        s.guards.in_flight.lock().unwrap().remove(&hash);
         return err(StatusCode::TOO_MANY_REQUESTS, "busy, retry shortly");
     };
     let s = s.clone();
@@ -480,6 +650,7 @@ async fn report_tx(State(s): S, Json(body): Json<Value>) -> Response {
             Ok(n) => tracing::info!(hash, events = n, "transaction indexed"),
             Err(e) => tracing::warn!(hash, err = %e, "transaction not indexed"),
         }
+        s.guards.in_flight.lock().unwrap().remove(&hash);
     });
     (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
 }
@@ -495,12 +666,11 @@ async fn faucet(
     let Some(base) = &s.keeper_url else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "faucet disabled");
     };
-    let ip = headers
-        .get("x-forwarded-for")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.split(',').next())
-        .map(|x| x.trim().to_string())
-        .unwrap_or_else(|| addr.ip().to_string());
+    let ip = client_ip(
+        headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()),
+        addr.ip(),
+        s.guards.trusted_hops,
+    );
     let resp = s
         .http
         .post(format!("{}/faucet", base.trim_end_matches('/')))
@@ -515,22 +685,44 @@ async fn faucet(
             let v: Value = r.json().await.unwrap_or(Value::Null);
             (code, Json(v)).into_response()
         }
-        Err(e) => err(StatusCode::BAD_GATEWAY, e),
+        Err(e) => {
+            tracing::warn!(err = %e, "faucet forward failed");
+            err(StatusCode::BAD_GATEWAY, "faucet unavailable, try again later")
+        }
     }
 }
 
 // ── WebSocket ──
 
-async fn ws_handler(State(s): S, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, s))
+async fn ws_handler(State(s): S, ws: WebSocketUpgrade) -> Response {
+    // Each socket holds a task and a broadcast receiver: cap them.
+    let Ok(permit) = s.guards.ws.clone().try_acquire_owned() else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "too many live connections");
+    };
+    // Clients only ever send pings; nothing large is expected inbound.
+    ws.max_message_size(4096)
+        .max_frame_size(4096)
+        .on_upgrade(move |socket| async move {
+            handle_ws(socket, s).await;
+            drop(permit);
+        })
+}
+
+const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Send with a deadline: a client that stops reading must not pin its task.
+async fn ws_send(socket: &mut axum::extract::ws::WebSocket, m: Message) -> bool {
+    matches!(tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(m)).await, Ok(Ok(())))
 }
 
 /// Server → client JSON messages: `{"event": "...", "data": {...}, ...}`.
 /// On connect the client gets a `snapshot` with every market's live state.
+/// `{"event":"resync"}` means this client fell behind and missed messages:
+/// refetch over REST.
 async fn handle_ws(mut socket: axum::extract::ws::WebSocket, s: Arc<AppState>) {
     let mut rx = s.tx.subscribe();
     let snap = json!({ "event": "snapshot", "data": *s.live.read().await }).to_string();
-    if socket.send(Message::Text(snap.into())).await.is_err() {
+    if !ws_send(&mut socket, Message::Text(snap.into())).await {
         return;
     }
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(25));
@@ -538,9 +730,12 @@ async fn handle_ws(mut socket: axum::extract::ws::WebSocket, s: Arc<AppState>) {
         tokio::select! {
             msg = rx.recv() => match msg {
                 Ok(m) => {
-                    if socket.send(Message::Text(m.into())).await.is_err() { break; }
+                    if !ws_send(&mut socket, Message::Text(m.into())).await { break; }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let m = json!({ "event": "resync" }).to_string();
+                    if !ws_send(&mut socket, Message::Text(m.into())).await { break; }
+                }
                 Err(_) => break,
             },
             incoming = socket.recv() => match incoming {
@@ -548,8 +743,21 @@ async fn handle_ws(mut socket: axum::extract::ws::WebSocket, s: Arc<AppState>) {
                 _ => {}
             },
             _ = ping.tick() => {
-                if socket.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
+                if !ws_send(&mut socket, Message::Ping(Vec::new().into())).await { break; }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_live_account;
+
+    #[test]
+    fn only_the_live_account_route_counts_as_a_chain_read() {
+        assert!(is_live_account("/account/alice.testnet"));
+        assert!(!is_live_account("/account/alice.testnet/fills"));
+        assert!(!is_live_account("/account/"));
+        assert!(!is_live_account("/accounts"));
     }
 }
