@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    name: contract and engine tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The contract: unit tests, the review's regression tests and the
+      # custody-after-every-call scenario. Tests marked #[ignore] are open
+      # proposals in docs/review-2026-11-18.md and are expected to fail.
+      - name: contract tests
+        run: cargo test -p neap
+      # The vendored risk engine.
+      - name: engine tests
+        run: cargo test -p percolator --features fuzz
