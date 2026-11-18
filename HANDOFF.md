@@ -157,3 +157,27 @@ Steps 1.7 (conditional orders), 1.8 (fees), 1.9 (admin roles) implemented. 48 te
 - Both tests pass. 48 unit tests + 2 sandbox tests all green.
 
 Next: 1.10 keeper (off-chain), 1.11 indexer + API, 1.12 security gate + mainnet deploy.
+
+## 2026-11-18: production-readiness review of the contract
+
+Six parallel reviews (accounting, risk math, oracle and orders, NEAR platform, access and upgrades, coverage).
+Everything is in `docs/review-2026-11-18.md`; raw reviewer notes are in `docs/review-2026-11-18/`.
+
+Changed in this PR (each has a regression test in `crates/neap/tests/poc_*.rs` or `cov_*.rs`):
+- `liquidate` takes the caller's 60% out of engine insurance before crediting it (custody invariant).
+- Fills obey the market mode in both `execute_order` and `execute_conditional`; conditionals obey OI caps.
+- OI caps and the dynamic spread use the traders' net position (the pool's exposure), not the mirrored engine OI.
+- Order sizes above `i128::MAX` are refused. TP/SL clamp to the remaining position. Zero-limit buys are refused.
+- Everything except `crank` requires the market to be caught up to the current block.
+- `withdraw_margin` (with a position), `lp_deposit` / `lp_redeem` (pool exposed) and `keeper_step` refuse prices
+  an hour old or more. `deposit` works in `PriceUncertain`.
+- `push_price` is refused on `NearPool` markets. `on_price_read` takes one sample per block and no longer
+  freezes after a move of more than 20%.
+- Admin methods need 1 yoctoNEAR. Stranger `Major` listings, bad symbols and oversized price sources are refunded.
+- `quote` rounds the fee up like the engine. New events: wallet/margin/LP moves and admin changes.
+- CI workflow added. The committed testnet key was removed from `CONTRACT.md` (rotate it).
+
+Callers must change: admin calls attach 1 yocto; after a long idle gap call `crank` until it stops making progress.
+
+Not done, waiting on jason (proposals P-1 to P-12 in the review doc). The `#[ignore]`d tests fail until decided.
+Not run here: Kani, the wasm build and the sandbox tests (tooling not installed in the review environment).

@@ -204,6 +204,24 @@ insurance 10%, protocol 10%. Liquidation fee → caller 60%, insurance 40%.
 8. **Fees conserve:** Σ fee ledgers paid ≤ fees accrued; splits sum to 100% with rounding dust to insurance.
 9. **Price source immutability:** a market's price source can't change after activation (a new market generation instead).
 
+### Rules added 2026-11-18 (review, `docs/review-2026-11-18.md`)
+
+10. **Engine vault link:** `custody_vaults` equals the sum of engine vaults. Any amount credited to a wallet from a
+    market (fees, liquidation reward) is withdrawn from the engine first.
+11. **Mode gates fills:** opens fill only in `Active`; `ReduceOnly` fills closes; no other mode fills. The rule is the
+    same for orders and conditionals. Margin top-up works in every mode where liquidation runs.
+12. **Caught up:** every method except `crank` requires the engine to have reached the current block.
+13. **No action on an hour-old price** where the result depends on the mark: fills, liquidation, `keeper_step`,
+    margin withdrawal with an open position, LP deposit or redeem while the pool has exposure.
+14. **OI caps and spread use the traders' net position** per side (the pool's exposure). The pool mirrors every fill,
+    so the engine's long and short OI are always equal. A fill that shrinks the net is never refused by a cap and
+    pays `spread_min`. Conditionals obey the caps.
+15. **One pool sample per block** for `NearPool` markets. A reading outside the 20% band is not an observation, but
+    the EMA steps toward it, clamped to the band edge.
+16. **Admin calls need 1 yoctoNEAR.** `Major` tier listings are owner-only. Symbols are 1 to 32 of letters, digits,
+    `-`, `_`, `/`. A `Tee` source names 1 to 8 pools of at most 64 bytes. A refused listing is refunded in full.
+17. **Sizes** are at most `i128::MAX`. A TP/SL fills for at most the remaining position.
+
 ## 7. Gap list: what the port has vs what to build
 
 | Area | In `percolator/near` today | To build |
@@ -226,5 +244,7 @@ insurance 10%, protocol 10%. Liquidation fee → caller 60%, insurance 40%.
 
 `market_created`, `market_activated`, `market_mode_changed`, `price_observed`, `order_requested`, `order_executed`,
 `order_cancelled`, `order_expired`, `conditional_placed`, `conditional_triggered`, `fill`, `liquidation`, `funding_settled`,
-`deposit`, `withdraw`, `refund_parked`, `lp_deposit`, `lp_redeem`, `fees_accrued`, `fees_claimed`.
+`deposit` (wallet to margin), `margin_withdraw`, `wallet_deposit`, `withdraw`, `withdraw_failed`, `refund_parked`,
+`lp_deposit`, `lp_redeem`, `fees_accrued`, `fees_claimed`, `oi_caps_changed`, `owner_changed`, `oracle_changed`,
+`pauser_changed`. Not emitted yet: `order_executed` (use `fill`), `funding_settled`, `refund_parked`, `fees_accrued`.
 Every event carries `market`, `owner` (if any), integer amounts as strings, and `block`.
