@@ -12,7 +12,12 @@ NEAR events → Postgres, plus a REST + WebSocket API for the frontend (plan ste
 3. **API.** REST + WebSocket. All amounts are strings or integers in atoms: USDC has 6 decimals and
    prices are `price_e6` (USD × 10^6).
 
-All data is rebuildable from chain. The indexer is display-only; the contract is the source of truth.
+The indexer is display-only; the contract is the source of truth. History is **not** yet rebuildable from
+chain: block ranges the fetcher had to skip are listed in the `skipped_ranges` table and there is no backfill
+job (see `docs/reviews/2026-11-18-offchain-review.md`). Each receipt is written in one transaction, so an
+event is either fully indexed or retried. Requests over the per-client limits get HTTP 429. On the
+WebSocket, `{"event":"resync"}` means the client fell behind and should refetch over REST. Every market
+object carries `fetched_at_ms`.
 
 ## Run
 
@@ -33,6 +38,14 @@ Deployment (indexer + keeper in one container): `deploy/Dockerfile`, `deploy/sta
 | `NEAR_RPC_URL` | `https://test.rpc.fastnear.com` | RPC for view calls |
 | `NEARDATA_URL` | `https://testnet.neardata.xyz` | Block stream |
 | `START_BLOCK` | latest | First block to index on an empty DB |
+| `RESET_ON_CONTRACT_CHANGE` | unset | Set to `1` to let a changed `NEAP_CONTRACT` wipe the tables |
+| `API_CHAIN_PER_MIN` | `120` | Per-client limit for routes that call an RPC (`/account/:owner`, `/view`, `/quote`) |
+| `API_WRITE_PER_MIN` | `30` | Per-client limit for `POST /tx` and `POST /faucet` |
+| `API_READ_PER_MIN` | `600` | Per-client limit for everything else |
+| `API_VIEW_CACHE_MS` | `2000` | How long a contract view result is reused |
+| `WS_MAX_CONNECTIONS` | `500` | Open WebSocket cap |
+| `TRUSTED_PROXY_HOPS` | unset | Proxies in front of the service. Set it so the client address is taken from the right of `X-Forwarded-For` (unforgeable); unset uses the leftmost entry, which a client can fake |
+| `TEST_DATABASE_URL` | unset | Tests only: Postgres for the database scenarios |
 | `POLL_INTERVAL_MS` | `700` | Head poll interval |
 | `LIVE_REFRESH_MS` | `3000` | Live market refresh interval |
 | `KEEPER_INTERNAL_URL` | unset | Keeper faucet address; enables `POST /faucet` |
@@ -42,7 +55,7 @@ Deployment (indexer + keeper in one container): `deploy/Dockerfile`, `deploy/sta
 
 | Method | Path | Returns |
 |--------|------|---------|
-| GET | `/health` | `{ok, contract, last_indexed_block, live_markets, faucet}` |
+| GET | `/health` | `{ok, status: "ok"/"degraded", problems: [...], contract, last_indexed_block, skipped_ranges, live_markets, live_age_ms, keeper, faucet}`. Always 200; monitor `status` |
 | GET | `/config` | `{network, contract, quote_token, quote_decimals, price_decimals, faucet}` |
 | GET | `/markets` | Live `get_market` view per market + `id` + `stats_24h {open, high, low, last, change_bps, trades}` |
 | GET | `/markets/:id` | Same, one market |

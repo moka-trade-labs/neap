@@ -17,13 +17,14 @@
 Amal's full-access key on `neap-trade.testnet`:
 
 - **Public key:** `ed25519:DvT51sFiedZNjz1tRP4Ve2L6n8C27bYMcRwnAzjwysjn`
-- **Private key:** `ed25519:5PWRmzv543jV4wN7wr3QLEqC7Eonc5npiFpznbex5dV2iFexXFYAVhvwa8tZPbNDZdtkWgJ4bxv9kgq7Bk9hRPfe`
-- **Seed phrase:** `hungry glory swallow fence wheat victory skill economy fatigue shift trigger myth`
+- **Private key and seed phrase:** removed from this file on 2026-11-18. They were committed here and
+  are still in git history, so treat this key as public: delete it from the account (command below)
+  and add a fresh one. Share keys through a password manager, never the repo.
 
 To import into CLI:
 
 ```bash
-near account import-account using-private-key ed25519:5PWRmzv543jV4wN7wr3QLEqC7Eonc5npiFpznbex5dV2iFexXFYAVhvwa8tZPbNDZdtkWgJ4bxv9kgq7Bk9hRPfe network-config testnet
+near account import-account using-private-key ed25519:<your-private-key> network-config testnet
 ```
 
 This key has **full access** to the contract account (owner powers: create markets, push prices, set admin roles). To revoke later:

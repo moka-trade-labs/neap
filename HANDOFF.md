@@ -187,3 +187,31 @@ Known gaps (not fixed, by priority):
 7. Free Render instance and free Postgres (expires 2026-12-13); public RPCs with failover, no paid key.
 8. Path 2 (Solana tokens through a TEE oracle, opening and creating from Solana) is not started in the
    services: `oracle-agent` and `relayer` are skeletons.
+
+## 2026-11-18: off-chain review and hardening
+
+Full findings, what was fixed and what is open: `docs/reviews/2026-11-18-offchain-review.md`.
+
+What changed (services only; no contract or engine change):
+- Keeper: prices from Coinbase and Kraken are cross-checked before a push; the fixed fallback price is
+  dev-only; nonce never moves backwards; order retries back off; conditionals have their own task; watchdog
+  `ALERT` logs and `GET /status`; faucet is testnet-only with a race-free limit.
+- Indexer: each receipt is written in one transaction; out-of-order events no longer strand orders as
+  `pending`; triggered conditionals appear as fills; `START_BLOCK` works; skipped ranges are recorded.
+- API: per-client rate limits, request deadline, view cache, a `/health` that reports `ok`/`degraded`,
+  bounded candle query, WebSocket caps.
+- CI workflow, non-root container, private key removed from `CONTRACT.md`.
+
+Not deployed. Nothing on Render was touched. New env vars all have safe defaults; none is required.
+On deploy, behaviour changes to expect: the keeper pushes nothing when its two price sources disagree by
+more than 1%, and the API returns HTTP 429 over the per-client limits.
+
+Defaults I chose (unconfirmed by jason):
+- Price agreement 1% between sources; single-source move cap 5% against the on-chain price.
+- API limits per client per minute: 120 chain reads, 30 writes, 600 other.
+- `/health` stays HTTP 200 when degraded, so Render does not restart-loop on an RPC outage.
+
+Waiting on jason: section 3 of the review (leaked key, database expiry on 2026-12-13, oracle trust model,
+key separation, liquidation view, market allow-list, event source, hosting).
+
+Next: O1 backfill from `skipped_ranges`, O2 candle rollup and retention, O4 alert delivery.
