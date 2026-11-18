@@ -187,3 +187,14 @@ Known gaps (not fixed, by priority):
 7. Free Render instance and free Postgres (expires 2026-12-13); public RPCs with failover, no paid key.
 8. Path 2 (Solana tokens through a TEE oracle, opening and creating from Solana) is not started in the
    services: `oracle-agent` and `relayer` are skeletons.
+
+## 2026-11-18: design review (docs only)
+
+- `docs/review/2026-11-18-design-review.md`: ranked findings on the product and mechanism design from a
+  five-seat committee (trader, LP, lister/attacker, risk skeptic, competitor). No code or spec changed.
+- `docs/review/2026-11-18-proposals.md`: seven **proposed** decisions (P1–P7). None is accepted. Each needs
+  jason's answer, then a dated entry in `docs/decisions.md` and a spec diff before code.
+- Shortest list items 1–4 (bound the listing surface, fix the mark, unconditional exits, pay LPs) implement the
+  existing spec and do not reverse a decision.
+- Passed to the contract audit, not verified here: the liquidator payout in `liquidate` leaves custody without
+  an engine insurance withdrawal (`contract.rs:1580`).
