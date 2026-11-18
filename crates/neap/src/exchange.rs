@@ -350,6 +350,17 @@ pub fn catch_up(
     Ok(())
 }
 
+/// `catch_up` does bounded work, so after a long idle gap it can stop short
+/// of `now_slot`. Anything that prices, fills or releases funds must run on a
+/// market that reached the current block: otherwise funding and the price
+/// path for the missing slots are simply skipped.
+pub fn require_caught_up(g: &Group, now_slot: u64) -> ExResult<()> {
+    if g.asset()?.slot_last < now_slot {
+        return Err(ExError::OracleNotCaughtUp);
+    }
+    Ok(())
+}
+
 /// Engine market mode is Live (encoding 0, see engine `encode_market_mode`).
 pub fn is_live(g: &Group) -> bool {
     g.header.mode == 0

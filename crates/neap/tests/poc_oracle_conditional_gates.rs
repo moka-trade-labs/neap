@@ -150,7 +150,7 @@ fn reverts<F: FnOnce()>(f: F) -> bool {
 fn opening_conditional_must_respect_oi_cap() {
     let (mut e, mut c) = setup();
     let bob = setup_bob(&mut e, &mut c);
-    e.call(&accounts(0), ZERO);
+    e.call(&accounts(0), NearToken::from_yoctonear(1));
     c.set_oi_caps(0, U128(5 * POS_SCALE), U128(5 * POS_SCALE), U128(2 * POS_SCALE));
 
     // "Limit buy" whose trigger is always crossed == a market order.
@@ -180,7 +180,7 @@ fn opening_conditional_must_respect_oi_cap() {
 fn opening_conditional_must_not_fill_in_reduce_only_market() {
     let (mut e, mut c) = setup();
     let bob = setup_bob(&mut e, &mut c);
-    e.call(&accounts(0), ZERO);
+    e.call(&accounts(0), NearToken::from_yoctonear(1));
     c.set_mode(0, Mode::ReduceOnly);
 
     // Placement is even allowed while the market is already ReduceOnly.
@@ -212,7 +212,7 @@ fn opening_order_must_not_fill_in_price_uncertain_market() {
     let bob = setup_bob(&mut e, &mut c);
     e.call(&bob, ONE);
     let oid = c.request_order(0, OrderSide::Long, U128(10 * POS_SCALE), U64(u64::MAX), 30, false);
-    e.call(&accounts(0), ZERO);
+    e.call(&accounts(0), NearToken::from_yoctonear(1));
     c.set_mode(0, Mode::PriceUncertain); // pauser hits the big red button
     e.tick(1);
     push(&mut e, &mut c, 0, PRICE);

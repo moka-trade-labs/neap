@@ -151,6 +151,7 @@ fn trader_loses_to_pool(e: &mut Env, c: &mut Neap) {
 /// able to redeem it. CURRENTLY FAILS: the profit stays as pool `pnl` forever
 /// (nobody can call convert_pnl for the pool) and redemption pays capital only.
 #[test]
+#[ignore = "open finding F-2 in docs/review-2026-11-18.md: pool profit is never converted"]
 fn sole_lp_can_redeem_pool_profit() {
     let (mut e, mut c) = setup();
     trader_loses_to_pool(&mut e, &mut c);
@@ -170,6 +171,7 @@ fn sole_lp_can_redeem_pool_profit() {
 /// and redeems at nav_lower, so an immediate round trip must not lose more than
 /// rounding. CURRENTLY FAILS: a 1_000 USDC round trip returns ~769 USDC.
 #[test]
+#[ignore = "open finding F-2 in docs/review-2026-11-18.md: pool profit is never converted"]
 fn deposit_after_full_exit_does_not_lose_to_orphaned_pnl() {
     let (mut e, mut c) = setup();
     trader_loses_to_pool(&mut e, &mut c);

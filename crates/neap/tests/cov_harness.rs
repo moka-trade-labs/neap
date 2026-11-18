@@ -9,9 +9,10 @@
 //!   fees claimed, known accounts.
 //! - `Act`: one public-method call (or one receipt chain, e.g. `withdraw` +
 //!   `on_withdraw`) as plain data, so a scenario is a `Vec<Act>` and can be
-//!   replayed. Replay is how a reverted receipt is modelled: the mocked runtime
-//!   does not roll state back on panic, so `Fuzz::try_step` rebuilds the world
-//!   from the log of successful acts.
+//!   replayed. The mocked runtime does not roll state back on panic, so
+//!   `Fuzz::try_step` checkpoints the contract (root struct + mocked storage)
+//!   before each act and restores it when the act is refused, like a reverted
+//!   receipt.
 //! - `World::check`: the invariants of docs/contract.md §6 that are checkable
 //!   from the public surface, asserted after EVERY act:
 //!     inv 1 custody   token balance == custody_wallets + custody_vaults,
@@ -30,12 +31,12 @@ use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Once;
 
+use neap::model::{ConditionalKind, Mode, OrderSide, Owner, Payee};
+use neap::{MarketParamsJson, Neap};
 use near_sdk::json_types::{U128, U64};
 use near_sdk::serde_json;
 use near_sdk::test_utils::{get_logs, VMContextBuilder};
 use near_sdk::{testing_env, AccountId, NearToken, PromiseOrValue, PromiseResult};
-use neap::model::{ConditionalKind, Mode, OrderSide, Owner, Payee};
-use neap::{MarketParamsJson, Neap};
 
 pub use percolator::POS_SCALE;
 
@@ -122,39 +123,133 @@ pub enum Act {
     Register(usize),
     /// `ft_on_transfer` from the USDC contract. The shadow token balance grows
     /// by `amount - refund`.
-    FtIn { who: usize, amount: u128, msg: String },
-    OpenAccount { who: usize, m: u32 },
-    Deposit { who: usize, m: u32, amount: u128 },
-    WithdrawMargin { who: usize, m: u32, amount: u128 },
-    Request { who: usize, m: u32, long: bool, size_q: u128, limit: u64, expiry: u64, reduce_only: bool },
-    Execute { order: u64, by: usize },
-    Cancel { order: u64, who: usize },
+    FtIn {
+        who: usize,
+        amount: u128,
+        msg: String,
+    },
+    OpenAccount {
+        who: usize,
+        m: u32,
+    },
+    Deposit {
+        who: usize,
+        m: u32,
+        amount: u128,
+    },
+    WithdrawMargin {
+        who: usize,
+        m: u32,
+        amount: u128,
+    },
+    Request {
+        who: usize,
+        m: u32,
+        long: bool,
+        size_q: u128,
+        limit: u64,
+        expiry: u64,
+        reduce_only: bool,
+    },
+    Execute {
+        order: u64,
+        by: usize,
+    },
+    Cancel {
+        order: u64,
+        who: usize,
+    },
     /// kind: 0 = TakeProfit, 1 = StopLoss, 2 = Limit.
-    PlaceCond { who: usize, m: u32, kind: u8, long: bool, size_q: u128, trigger: u64, limit: u64, expiry: u64, reduce_only: bool },
-    ExecCond { cond: u64, by: usize },
-    CancelCond { cond: u64, who: usize },
+    PlaceCond {
+        who: usize,
+        m: u32,
+        kind: u8,
+        long: bool,
+        size_q: u128,
+        trigger: u64,
+        limit: u64,
+        expiry: u64,
+        reduce_only: bool,
+    },
+    ExecCond {
+        cond: u64,
+        by: usize,
+    },
+    CancelCond {
+        cond: u64,
+        who: usize,
+    },
     /// Oracle push with `publish_ns = now - age_ns`.
-    Push { m: u32, price: u64, age_ns: u64 },
-    Crank { m: u32 },
+    Push {
+        m: u32,
+        price: u64,
+        age_ns: u64,
+    },
+    Crank {
+        m: u32,
+    },
     /// tick(1) + crank until the engine price reaches the target (at most `max`).
-    Walk { m: u32, max: u32 },
-    KeeperStep { m: u32, who: usize, by: usize },
-    Liquidate { m: u32, who: usize, by: usize },
-    Convert { who: usize, m: u32 },
-    LpDeposit { who: usize, m: u32, amount: u128 },
-    LpRedeem { who: usize, m: u32, shares: u128 },
-    Insurance { who: usize, m: u32, amount: u128 },
+    Walk {
+        m: u32,
+        max: u32,
+    },
+    KeeperStep {
+        m: u32,
+        who: usize,
+        by: usize,
+    },
+    Liquidate {
+        m: u32,
+        who: usize,
+        by: usize,
+    },
+    Convert {
+        who: usize,
+        m: u32,
+    },
+    LpDeposit {
+        who: usize,
+        m: u32,
+        amount: u128,
+    },
+    LpRedeem {
+        who: usize,
+        m: u32,
+        shares: u128,
+    },
+    Insurance {
+        who: usize,
+        m: u32,
+        amount: u128,
+    },
     /// Claimed by the market's lister (`protocol == false`) or by the owner.
-    ClaimFees { m: u32, protocol: bool },
+    ClaimFees {
+        m: u32,
+        protocol: bool,
+    },
     /// `withdraw` then the `on_withdraw` callback with the given transfer result.
-    Withdraw { who: usize, amount: u128, transfer_ok: bool },
+    Withdraw {
+        who: usize,
+        amount: u128,
+        transfer_ok: bool,
+    },
     // ── admin ──
-    SetOiCaps { m: u32, long: u128, short: u128, acct: u128 },
-    SetMode { m: u32, uncertain: bool },
+    SetOiCaps {
+        m: u32,
+        long: u128,
+        short: u128,
+        acct: u128,
+    },
+    SetMode {
+        m: u32,
+        uncertain: bool,
+    },
     SetPauser(Option<usize>),
     SetOracle,
     SetOwner,
-    CreateMarketAdmin { price: u64 },
+    CreateMarketAdmin {
+        price: u64,
+    },
 }
 
 impl Act {
@@ -187,7 +282,12 @@ impl Act {
         use Act::*;
         matches!(
             self,
-            SetOiCaps { .. } | SetMode { .. } | SetPauser(_) | SetOracle | SetOwner | CreateMarketAdmin { .. }
+            SetOiCaps { .. }
+                | SetMode { .. }
+                | SetPauser(_)
+                | SetOracle
+                | SetOwner
+                | CreateMarketAdmin { .. }
         )
     }
 }
@@ -227,7 +327,13 @@ impl World {
                 // thread may have flushed its state.
                 testing_env!(VMContextBuilder::new().build());
                 near_sdk::mock::with_mocked_blockchain(|b| b.take_storage());
-                Self::ctx(100, 1_000_000_000_000, &user(OWNER), NearToken::from_near(1), vec![]);
+                Self::ctx(
+                    100,
+                    1_000_000_000_000,
+                    &user(OWNER),
+                    NearToken::from_near(1),
+                    vec![],
+                );
                 Neap::new(user(OWNER), usdc(), oracle())
             },
             token: 0,
@@ -309,7 +415,9 @@ impl World {
     /// `data[0][field]` of the last NEP-297 event named `event` in this call's logs.
     pub fn event_field(event: &str, field: &str) -> Option<String> {
         for l in get_logs().iter().rev() {
-            let Some(js) = l.strip_prefix("EVENT_JSON:") else { continue };
+            let Some(js) = l.strip_prefix("EVENT_JSON:") else {
+                continue;
+            };
             let v: serde_json::Value = serde_json::from_str(js).expect("event is JSON");
             if v["event"] == event {
                 return Some(match &v["data"][0][field] {
@@ -322,7 +430,9 @@ impl World {
     }
 
     pub fn has_event(event: &str) -> bool {
-        get_logs().iter().any(|l| l.contains(&format!("\"event\":\"{event}\"")))
+        get_logs()
+            .iter()
+            .any(|l| l.contains(&format!("\"event\":\"{event}\"")))
     }
 
     pub fn market_lister(&self, m: u32) -> AccountId {
@@ -345,17 +455,25 @@ impl World {
     }
 
     pub fn position(&self, m: u32, who: usize) -> i128 {
-        self.c.get_account(m, user(who)).map(|a| a.position_q.0).unwrap_or(0)
+        self.c
+            .get_account(m, user(who))
+            .map(|a| a.position_q.0)
+            .unwrap_or(0)
     }
 
     pub fn capital(&self, m: u32, who: usize) -> u128 {
-        self.c.get_account(m, user(who)).map(|a| a.capital.0).unwrap_or(0)
+        self.c
+            .get_account(m, user(who))
+            .map(|a| a.capital.0)
+            .unwrap_or(0)
     }
 
     /// The one market `a` may touch, resolving order ids to their market.
     pub fn act_market(&self, a: &Act) -> Option<u32> {
         match a {
-            Act::Execute { order, .. } | Act::Cancel { order, .. } => self.c.get_order(*order).map(|o| o.market),
+            Act::Execute { order, .. } | Act::Cancel { order, .. } => {
+                self.c.get_order(*order).map(|o| o.market)
+            }
             Act::ExecCond { cond, .. } | Act::CancelCond { cond, .. } => {
                 self.c.get_conditional(*cond).map(|o| o.market)
             }
@@ -395,10 +513,24 @@ impl World {
                 self.call(who, ONE);
                 self.c.withdraw_margin(m, U128(amount));
             }
-            Act::Request { who, m, long, size_q, limit, expiry, reduce_only } => {
+            Act::Request {
+                who,
+                m,
+                long,
+                size_q,
+                limit,
+                expiry,
+                reduce_only,
+            } => {
                 self.call(who, ONE);
-                let side = if long { OrderSide::Long } else { OrderSide::Short };
-                let id = self.c.request_order(m, side, U128(size_q), U64(limit), expiry, reduce_only);
+                let side = if long {
+                    OrderSide::Long
+                } else {
+                    OrderSide::Short
+                };
+                let id =
+                    self.c
+                        .request_order(m, side, U128(size_q), U64(limit), expiry, reduce_only);
                 self.orders.push(id.0);
             }
             Act::Execute { order, by } => {
@@ -406,24 +538,44 @@ impl World {
                 self.call(by, ZERO);
                 let px = self.c.execute_order(order);
                 if px.0 > 0 {
-                    let fee: u128 = Self::event_field("fill", "fee").expect("fill event").parse().unwrap();
+                    let fee: u128 = Self::event_field("fill", "fee")
+                        .expect("fill event")
+                        .parse()
+                        .unwrap();
                     self.fees_charged[m.unwrap() as usize] += fee;
                     self.fills += 1;
                 }
-                assert!(self.c.get_order(order).is_none(), "executed/expired order must be gone");
+                assert!(
+                    self.c.get_order(order).is_none(),
+                    "executed/expired order must be gone"
+                );
             }
             Act::Cancel { order, who } => {
                 self.call(who, ONE);
                 self.c.cancel_order(order);
             }
-            Act::PlaceCond { who, m, kind, long, size_q, trigger, limit, expiry, reduce_only } => {
+            Act::PlaceCond {
+                who,
+                m,
+                kind,
+                long,
+                size_q,
+                trigger,
+                limit,
+                expiry,
+                reduce_only,
+            } => {
                 self.call(who, STORAGE);
                 let kind = match kind {
                     0 => ConditionalKind::TakeProfit,
                     1 => ConditionalKind::StopLoss,
                     _ => ConditionalKind::Limit,
                 };
-                let side = if long { OrderSide::Long } else { OrderSide::Short };
+                let side = if long {
+                    OrderSide::Long
+                } else {
+                    OrderSide::Short
+                };
                 let id = self.c.place_conditional(
                     m,
                     kind,
@@ -448,7 +600,10 @@ impl World {
                     self.fees_charged[m.unwrap() as usize] += fee;
                     self.fills += 1;
                 }
-                assert!(self.c.get_conditional(cond).is_none(), "executed/expired conditional must be gone");
+                assert!(
+                    self.c.get_conditional(cond).is_none(),
+                    "executed/expired conditional must be gone"
+                );
             }
             Act::CancelCond { cond, who } => {
                 self.call(who, ONE);
@@ -479,7 +634,10 @@ impl World {
             Act::Liquidate { m, who, by } => {
                 self.call(by, ZERO);
                 let closed = self.c.liquidate(m, user(who));
-                let fee: u128 = Self::event_field("liquidation", "fee").expect("liquidation event").parse().unwrap();
+                let fee: u128 = Self::event_field("liquidation", "fee")
+                    .expect("liquidation event")
+                    .parse()
+                    .unwrap();
                 self.liq_fees[m as usize] += fee;
                 if closed.0 > 0 {
                     self.liquidations += 1;
@@ -512,18 +670,33 @@ impl World {
                 self.call_as(&who, ONE);
                 let got = self.c.claim_fees(m, payee).0;
                 assert!(got <= before, "claimed more than accrued");
-                assert_eq!(self.c.get_fee_ledger(m, payee).0, before - got, "ledger debited by the payout");
-                assert_eq!(self.c.get_wallet(who).0, wallet_before + got, "payout lands in the wallet");
+                assert_eq!(
+                    self.c.get_fee_ledger(m, payee).0,
+                    before - got,
+                    "ledger debited by the payout"
+                );
+                assert_eq!(
+                    self.c.get_wallet(who).0,
+                    wallet_before + got,
+                    "payout lands in the wallet"
+                );
                 self.fees_claimed[m as usize] += got;
             }
-            Act::Withdraw { who, amount, transfer_ok } => {
+            Act::Withdraw {
+                who,
+                amount,
+                transfer_ok,
+            } => {
                 let before = self.wallet(who);
                 self.call(who, ONE);
                 let _ = self.c.withdraw(U128(amount));
                 assert_eq!(self.wallet(who), before - amount, "debit first");
                 // In flight: the tokens have not left yet, the ledger is already debited.
                 let (cw, cv) = self.c.get_custody();
-                assert!(self.token >= cw.0 + cv.0, "in-flight withdraw: token balance covers the ledgers");
+                assert!(
+                    self.token >= cw.0 + cv.0,
+                    "in-flight withdraw: token balance covers the ledgers"
+                );
                 let result = if transfer_ok {
                     PromiseResult::Successful(vec![])
                 } else {
@@ -535,32 +708,54 @@ impl World {
                 if transfer_ok {
                     self.token -= amount;
                 } else {
-                    assert_eq!(self.wallet(who), before, "failed transfer re-credits exactly");
+                    assert_eq!(
+                        self.wallet(who),
+                        before,
+                        "failed transfer re-credits exactly"
+                    );
                 }
             }
-            Act::SetOiCaps { m, long, short, acct } => {
-                self.call(OWNER, ZERO);
+            Act::SetOiCaps {
+                m,
+                long,
+                short,
+                acct,
+            } => {
+                self.call(OWNER, NearToken::from_yoctonear(1));
                 self.c.set_oi_caps(m, U128(long), U128(short), U128(acct));
             }
             Act::SetMode { m, uncertain } => {
-                self.call(OWNER, ZERO);
-                self.c.set_mode(m, if uncertain { Mode::PriceUncertain } else { Mode::ReduceOnly });
+                self.call(OWNER, NearToken::from_yoctonear(1));
+                self.c.set_mode(
+                    m,
+                    if uncertain {
+                        Mode::PriceUncertain
+                    } else {
+                        Mode::ReduceOnly
+                    },
+                );
             }
             Act::SetPauser(p) => {
-                self.call(OWNER, ZERO);
+                self.call(OWNER, NearToken::from_yoctonear(1));
                 self.c.set_pauser(p.map(user));
             }
             Act::SetOracle => {
-                self.call(OWNER, ZERO);
+                self.call(OWNER, NearToken::from_yoctonear(1));
                 self.c.set_oracle(oracle());
             }
             Act::SetOwner => {
-                self.call(OWNER, ZERO);
+                self.call(OWNER, NearToken::from_yoctonear(1));
                 self.c.set_owner(user(OWNER));
             }
             Act::CreateMarketAdmin { price } => {
                 self.call(OWNER, NearToken::from_near(1));
-                self.c.create_market("X-PERP".into(), U64(price), params(), 5, U64(60_000_000_000));
+                self.c.create_market(
+                    "X-PERP".into(),
+                    U64(price),
+                    params(),
+                    5,
+                    U64(60_000_000_000),
+                );
                 self.sync_markets();
             }
         }
@@ -570,7 +765,11 @@ impl World {
     /// portfolio (users + the pool), LP shares and fee ledgers.
     pub fn market_snapshot(&self, m: u32) -> String {
         let mut s = serde_json::to_string(&self.c.get_market(m)).unwrap();
-        for a in USERS.iter().map(|u| u.parse::<AccountId>().unwrap()).chain([contract_id()]) {
+        for a in USERS
+            .iter()
+            .map(|u| u.parse::<AccountId>().unwrap())
+            .chain([contract_id()])
+        {
             s.push_str(&serde_json::to_string(&self.c.get_account(m, a.clone())).unwrap());
             s.push_str(&self.c.get_lp_shares(m, a).0.to_string());
             s.push('|');
@@ -596,7 +795,11 @@ impl World {
                 "m{m}:v={},i={},lp={},pool={};",
                 v.vault.0, v.insurance.0, v.lp_total_shares.0, v.pool_position_q.0
             ));
-            for a in USERS.iter().map(|u| u.parse::<AccountId>().unwrap()).chain([contract_id()]) {
+            for a in USERS
+                .iter()
+                .map(|u| u.parse::<AccountId>().unwrap())
+                .chain([contract_id()])
+            {
                 s.push_str(&serde_json::to_string(&self.c.get_account(m, a.clone())).unwrap());
                 s.push_str(&self.c.get_lp_shares(m, a).0.to_string());
             }
@@ -615,11 +818,14 @@ impl World {
 
         // inv 1a: the token balance backs the wrapper ledgers exactly.
         if self.token != cw + cv {
-            out.push(format!("inv1: token balance {} != custody wallets {} + vaults {}", self.token, cw, cv));
+            out.push(format!(
+                "inv1: token balance {} != custody wallets {} + vaults {}",
+                self.token, cw, cv
+            ));
         }
         // inv 1b: the wallet counter is the sum of the wallet ledger.
-        let wallets: u128 =
-            (0..USERS.len()).map(|i| self.wallet(i)).sum::<u128>() + self.c.get_wallet(contract_id()).0;
+        let wallets: u128 = (0..USERS.len()).map(|i| self.wallet(i)).sum::<u128>()
+            + self.c.get_wallet(contract_id()).0;
         if wallets != cw {
             out.push(format!("inv1: Σ wallets {wallets} != custody_wallets {cw}"));
         }
@@ -643,9 +849,14 @@ impl World {
                 ));
             }
             // LP share ledger.
-            let shares: u128 = (0..USERS.len()).map(|i| self.c.get_lp_shares(m, user(i)).0).sum();
+            let shares: u128 = (0..USERS.len())
+                .map(|i| self.c.get_lp_shares(m, user(i)).0)
+                .sum();
             if shares != v.lp_total_shares.0 {
-                out.push(format!("lp: market {m} Σ shares {shares} != lp_total_shares {}", v.lp_total_shares.0));
+                out.push(format!(
+                    "lp: market {m} Σ shares {shares} != lp_total_shares {}",
+                    v.lp_total_shares.0
+                ));
             }
             // inv 8: every atom of trading fee is on exactly one ledger or was paid out.
             let ledgers: u128 = PAYEES.iter().map(|p| self.c.get_fee_ledger(m, *p).0).sum();
@@ -677,16 +888,26 @@ impl World {
         let label = format!("#{} {:?}", self.log.len(), a);
         let n = self.n_markets();
         let target = self.act_market(&a);
-        let others: Vec<(u32, String)> =
-            (0..n).filter(|m| Some(*m) != target).map(|m| (m, self.market_snapshot(m))).collect();
+        let others: Vec<(u32, String)> = (0..n)
+            .filter(|m| Some(*m) != target)
+            .map(|m| (m, self.market_snapshot(m)))
+            .collect();
         let balances = a.is_admin().then(|| self.balance_snapshot(n));
         println!("step {label}"); // shown only when the test fails
         self.apply(&a);
         for (m, before) in others {
-            assert_eq!(before, self.market_snapshot(m), "inv2 isolation: `{label}` changed market {m}");
+            assert_eq!(
+                before,
+                self.market_snapshot(m),
+                "inv2 isolation: `{label}` changed market {m}"
+            );
         }
         if let Some(before) = balances {
-            assert_eq!(before, self.balance_snapshot(n), "inv6: admin act `{label}` changed a balance");
+            assert_eq!(
+                before,
+                self.balance_snapshot(n),
+                "inv6: admin act `{label}` changed a balance"
+            );
         }
         self.check(&label);
         self.log.push(a);
@@ -705,14 +926,26 @@ impl World {
     pub fn refresh_others(&mut self, m: u32, who: usize) {
         for i in 0..USERS.len() {
             if i != who && self.position(m, i) != 0 {
-                self.step(Act::KeeperStep { m, who: i, by: KEEPER });
+                self.step(Act::KeeperStep {
+                    m,
+                    who: i,
+                    by: KEEPER,
+                });
             }
         }
     }
 
     /// request → next block → fresh oracle push at `price` → (refresh the
     /// other exposed accounts for an open) → execute.
-    pub fn fill(&mut self, who: usize, m: u32, long: bool, size_q: u128, reduce_only: bool, price: u64) {
+    pub fn fill(
+        &mut self,
+        who: usize,
+        m: u32,
+        long: bool,
+        size_q: u128,
+        reduce_only: bool,
+        price: u64,
+    ) {
         self.step(Act::Request {
             who,
             m,
@@ -724,7 +957,11 @@ impl World {
         });
         let order = *self.orders.last().unwrap();
         self.step(Act::Tick(1));
-        self.step(Act::Push { m, price, age_ns: 0 });
+        self.step(Act::Push {
+            m,
+            price,
+            age_ns: 0,
+        });
         if !reduce_only {
             self.refresh_others(m, who);
         }
@@ -778,19 +1015,140 @@ impl Rng {
     }
 }
 
+/// Everything in a `World` except the contract, plus the contract's root
+/// struct (borsh) and the full mocked storage: enough to undo one call.
+pub struct Checkpoint {
+    root: Vec<u8>,
+    storage: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    height: u64,
+    ts: u64,
+    token: u128,
+    fees_charged: Vec<u128>,
+    fees_claimed: Vec<u128>,
+    liq_fees: Vec<u128>,
+    liquidations: u64,
+    fills: u64,
+    orders: Vec<u64>,
+    conds: Vec<u64>,
+}
+
+fn install_storage(storage: std::collections::HashMap<Vec<u8>, Vec<u8>>) {
+    let mut b = VMContextBuilder::new();
+    b.current_account_id(contract_id()); // views resolve the pool by this id
+    near_sdk::env::set_blockchain_interface(near_sdk::MockedBlockchain::new(
+        b.build(),
+        near_sdk::test_vm_config(),
+        near_sdk::RuntimeFeesConfig::test(),
+        vec![],
+        storage,
+        Default::default(),
+        None,
+    ));
+}
+
+impl World {
+    /// Flush the contract to the mocked storage and remember everything.
+    pub fn checkpoint(self) -> (World, Checkpoint) {
+        let World {
+            height,
+            ts,
+            c,
+            token,
+            fees_charged,
+            fees_claimed,
+            liq_fees,
+            liquidations,
+            fills,
+            orders,
+            conds,
+            log,
+        } = self;
+        let root = near_sdk::borsh::to_vec(&c).unwrap();
+        drop(c); // collections flush on drop
+        let storage = near_sdk::mock::with_mocked_blockchain(|b| b.take_storage());
+        install_storage(storage.clone());
+        let cp = Checkpoint {
+            root,
+            storage,
+            height,
+            ts,
+            token,
+            fees_charged: fees_charged.clone(),
+            fees_claimed: fees_claimed.clone(),
+            liq_fees: liq_fees.clone(),
+            liquidations,
+            fills,
+            orders: orders.clone(),
+            conds: conds.clone(),
+        };
+        let c: Neap = near_sdk::borsh::from_slice(&cp.root).unwrap();
+        (
+            World {
+                height,
+                ts,
+                c,
+                token,
+                fees_charged,
+                fees_claimed,
+                liq_fees,
+                liquidations,
+                fills,
+                orders,
+                conds,
+                log,
+            },
+            cp,
+        )
+    }
+
+    /// Undo everything since `cp` (a reverted receipt).
+    pub fn rollback(self, cp: Checkpoint) -> World {
+        let World { c, log, .. } = self;
+        drop(c); // flushes half-written state; the storage is replaced next
+        install_storage(cp.storage);
+        let c: Neap = near_sdk::borsh::from_slice(&cp.root).unwrap();
+        World {
+            height: cp.height,
+            ts: cp.ts,
+            c,
+            token: cp.token,
+            fees_charged: cp.fees_charged,
+            fees_claimed: cp.fees_claimed,
+            liq_fees: cp.liq_fees,
+            liquidations: cp.liquidations,
+            fills: cp.fills,
+            orders: cp.orders,
+            conds: cp.conds,
+            log,
+        }
+    }
+}
+
 /// A world that tolerates refused acts: a refused act is a reverted receipt,
-/// modelled by rebuilding the world from the log of successful acts.
+/// modelled by restoring the checkpoint taken just before it (contract root
+/// struct + mocked storage + shadow state).
 pub struct Fuzz {
     pub w: Option<World>,
     pub p0: u64,
     pub p1: u64,
     pub refused: u64,
     pub accepted: u64,
+    /// Why acts were refused: "ActKind: panic message" → count.
+    pub refusals: std::collections::BTreeMap<String, u64>,
+    pub last_refusal: String,
 }
 
 impl Fuzz {
     pub fn new(p0: u64, p1: u64) -> Fuzz {
-        Fuzz { w: Some(World::new(p0, p1)), p0, p1, refused: 0, accepted: 0 }
+        Fuzz {
+            w: Some(World::new(p0, p1)),
+            p0,
+            p1,
+            refused: 0,
+            accepted: 0,
+            refusals: Default::default(),
+            last_refusal: String::new(),
+        }
     }
 
     pub fn w(&self) -> &World {
@@ -798,24 +1156,33 @@ impl Fuzz {
     }
 
     /// Try one act. `true` if the contract accepted it. Invariants are checked
-    /// after an accepted act; after a refused one the state must equal the
-    /// state before it (that is what the replay gives, like a NEAR revert).
+    /// after an accepted act; a refused one is rolled back like a NEAR revert.
     pub fn try_step(&mut self, a: Act) -> bool {
-        let mut w = self.w.take().unwrap();
+        let (mut w, cp) = self.w.take().unwrap().checkpoint();
         let label = format!("#{} {:?}", w.log.len(), a);
         let n = w.n_markets();
         let target = w.act_market(&a);
-        let others: Vec<(u32, String)> =
-            (0..n).filter(|m| Some(*m) != target).map(|m| (m, w.market_snapshot(m))).collect();
+        let others: Vec<(u32, String)> = (0..n)
+            .filter(|m| Some(*m) != target)
+            .map(|m| (m, w.market_snapshot(m)))
+            .collect();
         let balances = a.is_admin().then(|| w.balance_snapshot(n));
         let r = quiet(|| w.apply(&a));
         match r {
             Ok(()) => {
                 for (m, before) in others {
-                    assert_eq!(before, w.market_snapshot(m), "inv2 isolation: `{label}` changed market {m}");
+                    assert_eq!(
+                        before,
+                        w.market_snapshot(m),
+                        "inv2 isolation: `{label}` changed market {m}"
+                    );
                 }
                 if let Some(before) = balances {
-                    assert_eq!(before, w.balance_snapshot(n), "inv6: admin act `{label}` changed a balance");
+                    assert_eq!(
+                        before,
+                        w.balance_snapshot(n),
+                        "inv6: admin act `{label}` changed a balance"
+                    );
                 }
                 w.check(&label);
                 w.log.push(a);
@@ -823,12 +1190,30 @@ impl Fuzz {
                 self.w = Some(w);
                 true
             }
-            Err(_) => {
-                let log = std::mem::take(&mut w.log);
-                // Drop the half-mutated contract BEFORE rebuilding: its
-                // collections flush on drop.
-                drop(w);
-                self.w = Some(World::replay(self.p0, self.p1, &log));
+            Err(e) => {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                let msg = msg
+                    .split("panic_msg: ")
+                    .last()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect::<String>();
+                let kind = format!("{a:?}")
+                    .split([' ', '('])
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                self.last_refusal = msg.clone();
+                *self.refusals.entry(format!("{kind}: {msg}")).or_insert(0) += 1;
+                let w = w.rollback(cp);
+                // A revert must restore a state that satisfies every invariant.
+                w.check(&format!("rollback of {label}"));
+                self.w = Some(w);
                 self.refused += 1;
                 false
             }

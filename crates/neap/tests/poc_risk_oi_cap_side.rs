@@ -1,3 +1,5 @@
+//! RISK-3: OI caps must bound trader exposure per side, not the pool's mirror leg.
+//! PoC from the risk review. Asserts the CORRECT behaviour, so it fails until fixed.
 #![allow(dead_code, unused_imports)]
 
 use neap::model::{ConditionalKind, Mode, OrderSide, Owner, Payee, PriceSource, Tier};
@@ -187,40 +189,48 @@ fn acct(c: &Neap, who: &AccountId, tag: &str) {
     println!("[{tag}] cap={} pnl={} res={} feecr={} pos={}", a.capital.0, a.pnl.0, a.reserved_pnl.0, a.fee_credits.0, a.position_q.0);
 }
 
+/// Caps 10/10. Bob is long 10 (pool short 10, so engine oi_long == oi_short == 10).
+/// Carol opening a short of 5 leaves trader short OI at 5 and REDUCES the pool's
+/// exposure, so it must be allowed. Today it reverts with "short OI cap exceeded"
+/// because the check adds her size to the pool's own short leg.
 #[test]
-fn explore_keeper_stale() {
+fn skew_reducing_open_is_not_blocked_by_the_other_sides_cap() {
     let (mut e, mut c) = setup();
     let bob = setup_bob(&mut e, &mut c);
-    request_and_fill(&mut e, &mut c, &bob, OrderSide::Long, 400 * POS_SCALE, u64::MAX, false);
-    walk_to(&mut e, &mut c, 92_000_000);
-    for _ in 0..1200 { e.tick(10); e.call(&accounts(3), NearToken::from_yoctonear(0)); c.crank(0); }
-    for i in 0..4 {
-        e.call(&accounts(3), NearToken::from_yoctonear(0));
-        let r = c.keeper_step(0, bob.clone());
-        println!("keeper_step {i} -> {r}");
-        acct(&c, &bob, "bob after");
-    }
-    dump(&c, "after");
-    println!("keeper wallet {}", c.get_wallet(accounts(3)).0);
-}
-
-#[test]
-fn explore_caps() {
-    let (mut e, mut c) = setup();
-    let bob = setup_bob(&mut e, &mut c);
-    e.call(&accounts(0), NearToken::from_yoctonear(0));
+    e.call(&accounts(0), NearToken::from_yoctonear(1));
     c.set_oi_caps(0, U128(10 * POS_SCALE), U128(10 * POS_SCALE), U128(0));
     request_and_fill(&mut e, &mut c, &bob, OrderSide::Long, 10 * POS_SCALE, u64::MAX, false);
-    dump(&c, "bob long 10 at cap");
-    // carol opens a short of 5: trader short OI = 5 <= cap 10, and it REDUCES pool skew
     let carol = accounts(4);
     fund(&mut e, &mut c, &carol, 10_000 * USDC);
     e.call(&carol, STORAGE);
     c.open_account(0);
     e.call(&carol, ONE);
     c.deposit(0, U128(5_000 * USDC));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        request_and_fill(&mut e, &mut c, &carol, OrderSide::Short, 5 * POS_SCALE, 0, false);
-    }));
-    println!("carol short 5 ok? {}", r.is_ok());
+    // The engine refuses any position-increasing fill while another account
+    // with a position has not been refreshed in this block, so the keeper's
+    // refresh of bob is part of the flow (see docs/review-2026-11-18.md, P-1).
+    e.call(&carol, ONE);
+    let oid = c.request_order(0, OrderSide::Short, U128(5 * POS_SCALE), U64(0), 30, false);
+    e.tick(1);
+    e.call(&oracle(), NearToken::from_yoctonear(0));
+    c.push_price(0, U64(PRICE), U64(e.ts));
+    e.call(&accounts(3), NearToken::from_yoctonear(0));
+    c.keeper_step(0, bob.clone());
+    e.call(&accounts(3), NearToken::from_yoctonear(0));
+    c.execute_order(oid.0);
+    assert_eq!(c.get_account(0, carol).unwrap().position_q.0, -(5 * POS_SCALE as i128));
+    assert_eq!(c.get_market(0).pool_position_q.0, -(5 * POS_SCALE as i128));
+}
+
+/// A plain (not flagged reduce-only) close at the cap must not be refused:
+/// it lowers OI.
+#[test]
+fn unflagged_close_at_cap_is_allowed() {
+    let (mut e, mut c) = setup();
+    let bob = setup_bob(&mut e, &mut c);
+    e.call(&accounts(0), NearToken::from_yoctonear(1));
+    c.set_oi_caps(0, U128(10 * POS_SCALE), U128(10 * POS_SCALE), U128(0));
+    request_and_fill(&mut e, &mut c, &bob, OrderSide::Long, 10 * POS_SCALE, u64::MAX, false);
+    request_and_fill(&mut e, &mut c, &bob, OrderSide::Short, 10 * POS_SCALE, 0, false);
+    assert_eq!(c.get_account(0, bob).unwrap().position_q.0, 0);
 }

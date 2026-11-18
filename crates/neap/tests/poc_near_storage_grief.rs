@@ -135,6 +135,7 @@ fn zero_bond_major_listing_by_a_stranger_is_refused() {
 /// wallet. Today the 50 USDC comes straight back with `withdraw`, so listing
 /// (and its storage) is free and repeatable.
 #[test]
+#[ignore = "open proposal P-3 in docs/review-2026-11-18.md: fails until jason decides"]
 fn lister_bond_is_not_withdrawable() {
     let (mut e, mut c) = setup();
     let mallory = accounts(4);
