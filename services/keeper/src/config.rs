@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     /// NEAR RPC endpoint.
     pub rpc_url: String,
@@ -17,8 +17,17 @@ pub struct Config {
     pub market_ids: Option<Vec<u32>>,
     /// Loop interval in milliseconds.
     pub loop_interval_ms: u64,
-    /// Fixed fallback price (price_e6) for Pushed markets when no live feed answers. 0 = none.
+    /// Fixed price (price_e6) for Pushed markets. Testnet only, and only used
+    /// when `live_prices` is off; never a fallback for a failed live feed.
     pub push_price_e6: u64,
+    /// Two live sources must agree within this many bps or nothing is pushed.
+    pub max_source_spread_bps: u64,
+    /// With one live source, the furthest it may be from the on-chain price.
+    pub single_source_max_move_bps: u64,
+    /// Log an error when an Active market's observation is older than this.
+    pub stale_alert_secs: u64,
+    /// Warn when the signer holds less than this (yoctoNEAR).
+    pub min_balance_yocto: u128,
     /// Live feed symbol overrides per market id ("0=NEAR,1=SOL"). Default: market symbol minus "-PERP".
     pub price_feeds: HashMap<u32, String>,
     /// Push the live price for Pushed markets (default true).
@@ -67,7 +76,11 @@ impl Config {
                 Some((k.trim().parse().ok()?, v.trim().to_uppercase()))
             })
             .collect();
-        let near_drip: f64 = env_or("FAUCET_NEAR", "0").parse().unwrap_or(0.0);
+        let push_price_e6: u64 = env_or("NEAP_PUSH_PRICE", "0").parse().unwrap_or(0);
+        let live_prices = env_or("NEAP_LIVE_PRICES", "true") != "false";
+        if !testnet && (push_price_e6 > 0 || !live_prices) {
+            anyhow::bail!("NEAP_PUSH_PRICE and NEAP_LIVE_PRICES=false are testnet-only");
+        }
         Ok(Config {
             rpc_url,
             contract_id,
@@ -75,15 +88,71 @@ impl Config {
             signer_key,
             market_ids,
             loop_interval_ms: env_or("NEAP_LOOP_MS", "3000").parse().unwrap_or(3000),
-            push_price_e6: env_or("NEAP_PUSH_PRICE", "0").parse().unwrap_or(0),
+            push_price_e6,
+            max_source_spread_bps: env_or("NEAP_MAX_SOURCE_SPREAD_BPS", "100").parse().unwrap_or(100),
+            single_source_max_move_bps: env_or("NEAP_SINGLE_SOURCE_MAX_MOVE_BPS", "500").parse().unwrap_or(500),
+            stale_alert_secs: env_or("NEAP_STALE_ALERT_SECS", "30").parse().unwrap_or(30),
+            min_balance_yocto: near_to_yocto(&env_or("NEAP_MIN_BALANCE_NEAR", "1")).unwrap_or(YOCTO),
             price_feeds,
-            live_prices: env_or("NEAP_LIVE_PRICES", "true") != "false",
+            live_prices,
             indexer_url: std::env::var("NEAP_INDEXER_URL").ok().filter(|s| !s.is_empty()),
             liq_every_ticks: env_or("NEAP_LIQ_EVERY", "5").parse().unwrap_or(5).max(1),
             faucet_addr: std::env::var("FAUCET_ADDR").ok().filter(|s| !s.is_empty()),
             faucet_token: env_or("FAUCET_TOKEN", "usdc.fakes.testnet"),
             faucet_amount: env_or("FAUCET_AMOUNT", "1000000000").parse().unwrap_or(1_000_000_000),
-            faucet_near_yocto: (near_drip * 1e6) as u128 * 1_000_000_000_000_000_000,
+            faucet_near_yocto: near_to_yocto(&env_or("FAUCET_NEAR", "0")).unwrap_or(0),
         })
+    }
+}
+
+const YOCTO: u128 = 1_000_000_000_000_000_000_000_000;
+
+/// "1.25" NEAR → yoctoNEAR, without floats. Up to 24 decimals.
+pub fn near_to_yocto(s: &str) -> Option<u128> {
+    let (int, frac) = s.trim().split_once('.').unwrap_or((s.trim(), ""));
+    if frac.len() > 24 || (int.is_empty() && frac.is_empty()) {
+        return None;
+    }
+    let int: u128 = if int.is_empty() { 0 } else { int.parse().ok()? };
+    let frac: u128 = format!("{frac:0<24}").parse().ok()?;
+    int.checked_mul(YOCTO)?.checked_add(frac)
+}
+
+/// The signing key must never reach a log line through `{:?}`.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("contract_id", &self.contract_id)
+            .field("signer_id", &self.signer_id)
+            .field("signer_key", &"<redacted>")
+            .field("rpc_url", &self.rpc_url)
+            .field("market_ids", &self.market_ids)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn near_amounts_parse_without_floats() {
+        assert_eq!(near_to_yocto("1"), Some(YOCTO));
+        assert_eq!(near_to_yocto("0.5"), Some(YOCTO / 2));
+        assert_eq!(near_to_yocto("0.000001"), Some(YOCTO / 1_000_000));
+        assert_eq!(near_to_yocto("0"), Some(0));
+        assert_eq!(near_to_yocto("abc"), None);
+        assert_eq!(near_to_yocto(""), None);
+    }
+
+    #[test]
+    fn debug_output_hides_the_signing_key() {
+        std::env::set_var("NEAP_CONTRACT", "x.testnet");
+        std::env::set_var("NEAP_SIGNER", "s.testnet");
+        std::env::set_var("NEAP_SIGNER_KEY", "ed25519:SUPERSECRETKEYMATERIAL");
+        let cfg = Config::from_env().unwrap();
+        let out = format!("{cfg:?}");
+        assert!(!out.contains("SUPERSECRET"), "{out}");
+        assert!(out.contains("<redacted>"));
     }
 }
