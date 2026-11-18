@@ -25,6 +25,7 @@ pub async fn ingest_tx(
     let params = json!({ "tx_hash": hash, "sender_account_id": signer, "wait_until": "EXECUTED" });
     let mut outcome = None;
     let mut last = anyhow!("transaction not executed yet");
+    let mut unknown = 0;
     for _ in 0..8 {
         match chain.rpc("tx", &params).await {
             Ok(v) => {
@@ -34,7 +35,17 @@ pub async fn ingest_tx(
                     break;
                 }
             }
-            Err(e) => last = e,
+            Err(e) => {
+                // A hash no RPC knows is either a few seconds early or made up:
+                // give it three tries, not eight, so junk reports stay cheap.
+                if e.to_string().contains("UNKNOWN_TRANSACTION") {
+                    unknown += 1;
+                }
+                last = e;
+                if unknown >= 3 {
+                    break;
+                }
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
     }
@@ -55,20 +66,23 @@ pub async fn ingest_tx(
             .unwrap_or_default();
         let evs = events::parse_logs(&logs);
         let rid = ro["id"].as_str().unwrap_or("");
-        if evs.is_empty() || rid.is_empty() || !db::mark_receipt(pool, rid).await? {
+        if evs.is_empty() || rid.is_empty() {
             continue;
         }
+        // Read the block before touching the database: if this fails the
+        // receipt stays unmarked and a later report or the block feed retries it.
         let b = chain.rpc("block", &json!({ "block_id": ro["block_hash"] })).await?;
-        let height = b["header"]["height"].as_u64().unwrap_or(0);
+        let height = b["header"]["height"].as_u64().ok_or_else(|| anyhow!("block without height"))?;
         let ts_ns = b["header"]["timestamp"].as_u64().unwrap_or(0);
         let ts = Utc
             .timestamp_opt((ts_ns / 1_000_000_000) as i64, (ts_ns % 1_000_000_000) as u32)
             .single()
             .unwrap_or_else(Utc::now);
+        let refs: Vec<&events::NeapEvent> = evs.iter().collect();
+        if !db::index_receipt(pool, rid, &refs, height, ts).await? {
+            continue;
+        }
         for ev in evs {
-            if let Err(e) = db::process_event(pool, &ev, height, ts).await {
-                tracing::error!(event = %ev.event, err = %e, "db write failed");
-            }
             let msg = json!({ "event": ev.event, "data": ev.data, "block": height, "ts": ts, "receipt_id": rid });
             let _ = tx.send(msg.to_string());
             count += 1;
