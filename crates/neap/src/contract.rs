@@ -55,6 +55,17 @@ const LIQ_CALLER_BPS: u128 = 6_000; // 60%
 const DEPTH_FLOOR_MAJOR: u128 = 10_000_000_000;
 /// Min pool depth for LongTail tier.
 const DEPTH_FLOOR_LONG_TAIL: u128 = 1_000_000_000;
+/// Longest market symbol, in bytes. Symbols are ASCII letters, digits, `-`, `_`, `/`.
+const MAX_SYMBOL_LEN: usize = 32;
+/// Most pool ids a `Tee` price source may name, and the longest single id.
+const MAX_TEE_POOLS: usize = 8;
+const MAX_TEE_POOL_ID_LEN: usize = 64;
+/// Largest order size: sizes are signed inside the engine, so anything above
+/// `i128::MAX` would wrap and flip the side of the order.
+const MAX_SIZE_Q: u128 = i128::MAX as u128;
+/// `on_price_read` band: a pool reading further than this from the EMA is not
+/// accepted as an observation.
+const BAND_BPS: u128 = 2_000;
 
 // ── Spread params per tier (spec §5) ──
 const MAJOR_SPREAD_MIN_BPS: u64 = 5;
@@ -263,6 +274,10 @@ impl Neap {
         max_oracle_age_ns: U64,
     ) -> u32 {
         self.assert_owner();
+        require!(
+            Self::symbol_ok(&symbol),
+            "symbol must be 1 to 32 of letters, digits, '-', '_', '/'"
+        );
         require!(spread_bps <= policy::MAX_SPREAD_BPS, "spread too wide");
         let start = env::storage_usage();
         let id = self.markets.len();
@@ -314,8 +329,16 @@ impl Neap {
         id
     }
 
+    /// Owner: set the oracle account. Requires 1 yoctoNEAR so a function-call
+    /// access key on the owner account cannot do it.
+    #[payable]
     pub fn set_oracle(&mut self, oracle: AccountId) {
+        assert_one_yocto();
         self.assert_owner();
+        emit(
+            "oracle_changed",
+            serde_json::json!({ "old": self.oracle.to_string(), "new": oracle.to_string() }),
+        );
         self.oracle = oracle;
     }
 
@@ -387,6 +410,10 @@ impl Neap {
                 let mut c = self.custody();
                 c.external_in(amount.0)
                     .unwrap_or_else(|| env::panic_str("custody overflow"));
+                emit(
+                    "wallet_deposit",
+                    serde_json::json!({ "owner": who.label(), "amount": amount.0.to_string() }),
+                );
                 self.wallets.insert(who, bal + amount.0);
                 self.set_custody(c);
                 PromiseOrValue::Value(U128(0))
@@ -414,7 +441,20 @@ impl Neap {
                     // Bond too small → refund.
                     return PromiseOrValue::Value(amount);
                 }
-                require!(spread_bps <= policy::MAX_SPREAD_BPS, "spread too wide");
+                // Majors are protocol-listed: only the owner may pick the tier
+                // that needs no bond and gets the highest leverage.
+                // A refused listing returns the whole amount to the sender.
+                if tier == Tier::Major && sender_id != self.owner {
+                    env::log_str("listing refused: Major tier markets are listed by the owner");
+                    return PromiseOrValue::Value(amount);
+                }
+                if !Self::symbol_ok(&symbol)
+                    || !Self::price_source_ok(&price_source)
+                    || spread_bps > policy::MAX_SPREAD_BPS
+                {
+                    env::log_str("listing refused: bad symbol, price source or spread");
+                    return PromiseOrValue::Value(amount);
+                }
                 let id = self.markets.len();
                 let gid = self.group_id(id);
                 Self::set_base_decimals(id, base_decimals);
@@ -504,6 +544,10 @@ impl Neap {
         let Owner::Near(to) = who.clone() else {
             env::panic_str("withdraw to a NEAR account only")
         };
+        emit(
+            "withdraw",
+            serde_json::json!({ "owner": who.label(), "amount": amount.0.to_string() }),
+        );
         ext_ft::ext(self.quote_token.clone())
             .with_attached_deposit(NearToken::from_yoctonear(1))
             .with_static_gas(GAS_FT_TRANSFER)
@@ -525,6 +569,13 @@ impl Neap {
                 let mut c = self.custody();
                 c.external_in(amount.0)
                     .unwrap_or_else(|| env::panic_str("custody overflow"));
+                emit(
+                    "withdraw_failed",
+                    serde_json::json!({
+                        "owner": account.label(),
+                        "amount": amount.0.to_string(),
+                    }),
+                );
                 self.wallets.insert(account, bal + amount.0);
                 self.set_custody(c);
                 false
@@ -539,7 +590,15 @@ impl Neap {
     pub fn deposit(&mut self, market: u32, amount: U128) {
         assert_one_yocto();
         let info = self.market(market);
-        require!(info.mode == Mode::Active || info.mode == Mode::ReduceOnly, "market not active");
+        // Topping up margin must stay possible in every mode where the account
+        // can still be liquidated.
+        require!(
+            matches!(
+                info.mode,
+                Mode::Active | Mode::ReduceOnly | Mode::PriceUncertain
+            ),
+            "market not active"
+        );
         let who = Self::user();
         self.debit_wallet(&who, amount.0);
         let mut g = self.load_group(market);
@@ -548,6 +607,14 @@ impl Neap {
         self.store_group(market, &g);
         self.store_portfolio(market, &who, &p);
         self.vault_in(amount.0);
+        emit(
+            "deposit",
+            serde_json::json!({
+                "market": market,
+                "owner": who.label(),
+                "amount": amount.0.to_string(),
+            }),
+        );
     }
 
     /// Move free margin (above initial margin, excluding unrealized profit)
@@ -560,11 +627,24 @@ impl Neap {
         let who = Self::user();
         let (mut g, mut info, _pool) = self.load_market_caught_up(market);
         let mut p = self.load_portfolio(market, &who);
+        // With an open position the free margin depends on the mark, so an
+        // hour-old price must not release it. A flat account can always leave.
+        if ok(exchange::effective_position_q(&g, &p)) != 0 {
+            Self::require_price_usable(&info, "withdraw with an open position");
+        }
         ok(exchange::withdraw(&mut g, &info.meta(), &mut p, amount.0));
         self.store_group(market, &g);
         self.store_portfolio(market, &who, &p);
         self.save_market(market, &mut info);
         self.vault_out_to_wallet(&who, amount.0);
+        emit(
+            "margin_withdraw",
+            serde_json::json!({
+                "market": market,
+                "owner": who.label(),
+                "amount": amount.0.to_string(),
+            }),
+        );
     }
 
     // ─────────────────────── 1.6: two-step orders ───────────────────────
@@ -585,6 +665,7 @@ impl Neap {
         assert_one_yocto();
         let who = Self::user();
         require!(size_q.0 > 0, "zero size");
+        require!(size_q.0 <= MAX_SIZE_Q, "size too large");
         require!(
             side == OrderSide::Short || limit_price.0 > 0,
             "zero limit for a buy"
@@ -665,10 +746,9 @@ impl Neap {
             "observation not newer than request block"
         );
 
-        // H-3 fix: enforce market mode (ReduceOnly blocks position-increasing).
-        if info.mode == Mode::ReduceOnly && !order.reduce_only {
-            env::panic_str("market is reduce-only");
-        }
+        // Market mode: opens only fill in Active; ReduceOnly fills closes only;
+        // every other mode fills nothing.
+        Self::require_fill_allowed(info.mode, order.reduce_only);
 
         // 1.2: stale ladder
         let age_ns = env::block_timestamp().saturating_sub(info.observation.source_ts);
@@ -686,17 +766,14 @@ impl Neap {
         let pool_acct = self.load_pool(market);
         let mut meta = info.meta();
         ok(exchange::catch_up(&mut g, &mut meta, &pool_acct, slot()));
+        ok(exchange::require_caught_up(&g, slot()));
         info.set_meta(meta);
 
         let mut p = self.load_portfolio(market, &order.owner);
         let mut pool = self.load_pool(market);
 
         // Reduce-only validation: the fill must shrink the user's position.
-        let size_q_signed: i128 = if order.side == OrderSide::Long {
-            order.size_q as i128
-        } else {
-            -(order.size_q as i128)
-        };
+        let size_q_signed = Self::signed_size(order.side, order.size_q);
         if order.reduce_only {
             let pos = ok(exchange::effective_position_q(&g, &p));
             let reduces = if size_q_signed > 0 {
@@ -709,32 +786,7 @@ impl Neap {
 
         // 1.5: OI cap enforcement
         if !order.reduce_only {
-            let asset = ok(g.asset());
-            if order.side == OrderSide::Long {
-                require!(
-                    policy::oi_within_cap(
-                        asset.oi_eff_long_q.saturating_add(order.size_q),
-                        info.oi_cap_long,
-                    ),
-                    "long OI cap exceeded"
-                );
-            } else {
-                require!(
-                    policy::oi_within_cap(
-                        asset.oi_eff_short_q.saturating_add(order.size_q),
-                        info.oi_cap_short,
-                    ),
-                    "short OI cap exceeded"
-                );
-            }
-            if info.per_account_cap != 0 {
-                let pos = ok(exchange::effective_position_q(&g, &p));
-                let new_abs = (pos + size_q_signed).unsigned_abs();
-                require!(
-                    policy::oi_within_cap(new_abs, info.per_account_cap),
-                    "per-account cap exceeded"
-                );
-            }
+            Self::check_oi_caps(&g, &info, &p, &pool, size_q_signed);
         }
 
         // 1.5: dynamic spread
@@ -867,6 +919,13 @@ impl Neap {
         let liquidity_usd = usdc_atoms; // conservative: quote-side reserve only
 
         let mut info = self.market(market);
+        // One sample per block. `refresh_price` is permissionless, so without
+        // this a caller could step the EMA many times off one pool state.
+        // `oracle_last_publish_ns` is the time of the last sample taken,
+        // accepted or not.
+        if info.oracle_last_publish_ns >= env::block_timestamp() {
+            return;
+        }
         // Band check: reject if the price moved more than 20% from EMA.
         if info.ema_e6 > 0 {
             let diff = if price_e6 > info.ema_e6 {
@@ -874,11 +933,29 @@ impl Neap {
             } else {
                 info.ema_e6 - price_e6
             };
-            if diff as u128 * policy::BPS / info.ema_e6 as u128 > 2_000 {
+            if diff as u128 * policy::BPS / info.ema_e6 as u128 > BAND_BPS {
                 // Too far from EMA → reduce-only mode (spec: move beyond band).
-                if info.mode == Mode::Active {
+                // The reading is not accepted as an observation (so nothing
+                // fills on it), but the EMA still takes one step toward it,
+                // clamped to the band edge. Without that step a real move of
+                // more than 20% would reject every later reading forever.
+                let band = (info.ema_e6 as u128 * BAND_BPS / policy::BPS) as u64;
+                let clamped = if price_e6 > info.ema_e6 {
+                    info.ema_e6.saturating_add(band).min(policy::MAX_PRICE)
+                } else {
+                    info.ema_e6.saturating_sub(band).max(1)
+                };
+                info.ema_e6 = policy::ema_next(info.ema_e6, clamped).unwrap_or(info.ema_e6);
+                // Count this as the block's sample. The observation itself is
+                // left alone, so the staleness ladder keeps counting from the
+                // last good reading and no order can fill on this one.
+                info.oracle_last_publish_ns = env::block_timestamp();
+                let was_active = info.mode == Mode::Active;
+                if was_active {
                     info.mode = Mode::ReduceOnly;
-                    self.save_market(market, &mut info);
+                }
+                self.save_market(market, &mut info);
+                if was_active {
                     emit(
                         "market_mode_changed",
                         serde_json::json!({
@@ -1002,7 +1079,8 @@ impl Neap {
         let notional = (size_q.0 as u128)
             .saturating_mul(exec_price as u128)
             / POS_SCALE;
-        let fee = notional * fee_bps as u128 / policy::BPS;
+        // The engine rounds the fee up (against the taker); quote the same.
+        let fee = (notional * fee_bps as u128).div_ceil(policy::BPS);
         (U64(exec_price), U64(spread), U64(fee as u64))
     }
 
@@ -1029,7 +1107,12 @@ impl Neap {
         let storage_start = env::storage_usage();
         let who = Self::user();
         require!(size_q.0 > 0, "zero size");
+        require!(size_q.0 <= MAX_SIZE_Q, "size too large");
         require!(trigger_price.0 > 0, "zero trigger");
+        require!(
+            side == OrderSide::Short || limit_price.0 > 0,
+            "zero limit for a buy"
+        );
         require!(
             expiry_blocks > 0 && expiry_blocks <= MAX_CONDITIONAL_EXPIRY_BLOCKS,
             "bad expiry"
@@ -1120,6 +1203,7 @@ impl Neap {
             let pool = self.load_pool(market);
             let mut meta = info.meta();
             ok(exchange::catch_up(&mut g, &mut meta, &pool, slot()));
+            ok(exchange::require_caught_up(&g, slot()));
             info.set_meta(meta);
             (g, pool)
         };
@@ -1150,6 +1234,9 @@ impl Neap {
         };
         require!(triggered, "trigger not crossed");
 
+        // Market mode: same rule as `execute_order`.
+        Self::require_fill_allowed(info.mode, cond.reduce_only);
+
         // Stale ladder
         let age_ns = env::block_timestamp().saturating_sub(info.observation.source_ts);
         let staleness = policy::observation_staleness(age_ns);
@@ -1164,25 +1251,30 @@ impl Neap {
         let mut p = self.load_portfolio(market, &cond.owner);
         let mut pool_p = self.load_pool(market);
 
-        // Reduce-only validation.
-        let size_q_signed: i128 = if cond.side == OrderSide::Long {
-            cond.size_q as i128
-        } else {
-            -(cond.size_q as i128)
-        };
+        // Reduce-only validation. A TP/SL placed for a position that has since
+        // been partly closed fills for what is left instead of reverting until
+        // it expires; it never flips the position.
+        let mut size_q = cond.size_q;
         if cond.reduce_only {
             let pos = ok(exchange::effective_position_q(&g, &p));
-            let reduces = if size_q_signed > 0 {
-                pos < 0 && size_q_signed <= pos.unsigned_abs() as i128
-            } else {
-                pos > 0 && size_q_signed.unsigned_abs() <= pos as u128
-            };
-            require!(reduces, "conditional does not reduce position");
+            let closes = if cond.side == OrderSide::Long { pos < 0 } else { pos > 0 };
+            require!(closes, "conditional does not reduce position");
+            if cond.kind != ConditionalKind::Limit {
+                size_q = size_q.min(pos.unsigned_abs());
+            }
+            require!(
+                size_q <= pos.unsigned_abs(),
+                "conditional does not reduce position"
+            );
+        }
+        let size_q_signed = Self::signed_size(cond.side, size_q);
+        if !cond.reduce_only {
+            Self::check_oi_caps(&g, &info, &p, &pool_p, size_q_signed);
         }
 
         let spread = self.compute_spread(&g, &info, &Order {
             id: 0, market, owner: cond.owner.clone(), side: cond.side,
-            size_q: cond.size_q, limit_price: cond.limit_price,
+            size_q, limit_price: cond.limit_price,
             request_block: 0, expiry_block: 0, reduce_only: cond.reduce_only,
         });
 
@@ -1313,6 +1405,7 @@ impl Neap {
     // ─────────────────────── 1.9: admin roles ───────────────────────
 
     /// Admin: set OI caps for a market.
+    #[payable]
     pub fn set_oi_caps(
         &mut self,
         market: u32,
@@ -1320,17 +1413,29 @@ impl Neap {
         oi_cap_short: U128,
         per_account_cap: U128,
     ) {
+        assert_one_yocto();
         self.assert_owner();
         let mut info = self.market(market);
         info.oi_cap_long = oi_cap_long.0;
         info.oi_cap_short = oi_cap_short.0;
         info.per_account_cap = per_account_cap.0;
         self.save_market(market, &mut info);
+        emit(
+            "oi_caps_changed",
+            serde_json::json!({
+                "market": market,
+                "oi_cap_long": oi_cap_long.0.to_string(),
+                "oi_cap_short": oi_cap_short.0.to_string(),
+                "per_account_cap": per_account_cap.0.to_string(),
+            }),
+        );
     }
 
     /// Pauser or owner: tighten market mode. Can only move to a MORE
     /// restrictive mode (invariant 6: no fund access).
+    #[payable]
     pub fn set_mode(&mut self, market: u32, new_mode: Mode) {
+        assert_one_yocto();
         self.assert_pauser_or_owner();
         require!(
             new_mode == Mode::ReduceOnly || new_mode == Mode::PriceUncertain,
@@ -1357,14 +1462,26 @@ impl Neap {
     }
 
     /// Owner: set the pauser account.
+    #[payable]
     pub fn set_pauser(&mut self, pauser: Option<AccountId>) {
+        assert_one_yocto();
         self.assert_owner();
+        emit(
+            "pauser_changed",
+            serde_json::json!({ "new": pauser.as_ref().map(|p| p.to_string()) }),
+        );
         self.pauser = pauser;
     }
 
     /// Owner: transfer ownership.
+    #[payable]
     pub fn set_owner(&mut self, owner: AccountId) {
+        assert_one_yocto();
         self.assert_owner();
+        emit(
+            "owner_changed",
+            serde_json::json!({ "old": self.owner.to_string(), "new": owner.to_string() }),
+        );
         self.owner = owner;
     }
 
@@ -1403,6 +1520,9 @@ impl Neap {
             fail(ExError::OracleLag);
         }
         if pool.active_bitmap.iter().any(|w| w.get() != 0) {
+            // Shares are priced off the pool's NAV, which depends on the mark
+            // while the pool has exposure.
+            Self::require_price_usable(&info, "LP deposit while the pool has exposure");
             ok(exchange::refresh(&mut g, &mut pool));
         }
         let (_, nav_upper) =
@@ -1420,6 +1540,15 @@ impl Neap {
         self.vault_in(amount.0);
         self.flush();
         self.charge_storage_after_yocto(storage_start);
+        emit(
+            "lp_deposit",
+            serde_json::json!({
+                "market": market,
+                "owner": who.label(),
+                "amount": amount.0.to_string(),
+                "shares": shares.to_string(),
+            }),
+        );
         U128(shares)
     }
 
@@ -1434,6 +1563,7 @@ impl Neap {
         require!(shares.0 > 0 && shares.0 <= held, "not enough shares");
         let (mut g, mut info, mut pool) = self.load_market_caught_up(market);
         if pool.active_bitmap.iter().any(|w| w.get() != 0) {
+            Self::require_price_usable(&info, "LP redeem while the pool has exposure");
             ok(exchange::refresh(&mut g, &mut pool));
         }
         let (nav_lower, _) =
@@ -1451,6 +1581,15 @@ impl Neap {
         if assets > 0 {
             self.vault_out_to_wallet(&who, assets);
         }
+        emit(
+            "lp_redeem",
+            serde_json::json!({
+                "market": market,
+                "owner": who.label(),
+                "shares": shares.0.to_string(),
+                "amount": assets.to_string(),
+            }),
+        );
         U128(assets)
     }
 
@@ -1480,6 +1619,12 @@ impl Neap {
             "price out of range"
         );
         let mut info = self.market(market);
+        // Invariant 9: a market priced from a NEAR pool only takes prices from
+        // that pool, never from the pushing oracle.
+        require!(
+            !matches!(info.price_source, PriceSource::NearPool { .. }),
+            "NearPool markets are priced by refresh_price"
+        );
         require!(
             policy::accept_oracle_update(
                 info.oracle_last_publish_ns,
@@ -1523,7 +1668,14 @@ impl Neap {
 
     /// Permissionless: advance the market to the current block.
     pub fn crank(&mut self, market: u32) {
-        let (g, mut info, _pool) = self.load_market_caught_up(market);
+        // Bounded work per call: after a long idle gap one crank may not reach
+        // the current block, so it saves partial progress and can be repeated.
+        let mut info = self.market(market);
+        let mut g = self.load_group(market);
+        let pool = self.load_pool(market);
+        let mut meta = info.meta();
+        ok(exchange::catch_up(&mut g, &mut meta, &pool, slot()));
+        info.set_meta(meta);
         self.store_group(market, &g);
         self.save_market(market, &mut info);
     }
@@ -1538,8 +1690,12 @@ impl Neap {
         let mut g = self.load_group(market);
         let pool = self.load_pool(market);
         if exchange::is_live(&g) {
+            // Same rule as `liquidate`: the step may liquidate, so it must not
+            // run on an hour-old price.
+            Self::require_price_usable(&info, "keeper step");
             let mut meta = info.meta();
             ok(exchange::catch_up(&mut g, &mut meta, &pool, slot()));
+            ok(exchange::require_caught_up(&g, slot()));
             info.set_meta(meta);
         }
         let funding = ok(exchange::funding_rate_e9(&g, &pool));
@@ -1567,19 +1723,19 @@ impl Neap {
         let (mut g, mut info, _pool) = self.load_market_caught_up(market);
         let mut p = self.load_portfolio(market, &account);
         let out = ok(exchange::liquidate(&mut g, &mut p));
+
+        // 1.8: liquidation fee split. The engine moved the whole fee from the
+        // liquidated account into its insurance. The caller's 60% has to leave
+        // the engine vault before it is credited to a wallet, or the wrapper's
+        // vault total drifts below the engine's (invariant 1). 40% stays put.
+        let liq_fee = out.fee_charged;
+        let caller_share = liq_fee * LIQ_CALLER_BPS / policy::BPS;
+        let paid = ok(exchange::withdraw_insurance_surplus(&mut g, caller_share));
         self.store_group(market, &g);
         self.store_portfolio(market, &account, &p);
         self.save_market(market, &mut info);
-
-        // 1.8: liquidation fee split. The engine already deducted the fee from
-        // the liquidated account. We pay the caller 60% from the vault.
-        let liq_fee = out.fee_charged;
-        if liq_fee > 0 {
-            let caller_share = liq_fee * LIQ_CALLER_BPS / policy::BPS;
-            // 40% stays in the engine's insurance (already there).
-            if caller_share > 0 {
-                self.vault_out_to_wallet(&caller, caller_share);
-            }
+        if paid > 0 {
+            self.vault_out_to_wallet(&caller, paid);
         }
 
         emit(
@@ -1590,6 +1746,7 @@ impl Neap {
                 "caller": caller.label(),
                 "closed_q": out.closed_q.to_string(),
                 "fee": liq_fee.to_string(),
+                "caller_reward": paid.to_string(),
             }),
         );
         U128(out.closed_q)
@@ -1718,8 +1875,7 @@ impl Neap {
             Ok(a) => a,
             Err(_) => return info.spread_bps, // fallback to fixed
         };
-        let oi_long = asset.oi_eff_long_q;
-        let oi_short = asset.oi_eff_short_q;
+        let _ = asset;
 
         // If OI caps are uncapped (0), fall back to fixed spread.
         let oi_cap = info.oi_cap_long.max(info.oi_cap_short);
@@ -1727,17 +1883,33 @@ impl Neap {
             return info.spread_bps;
         }
 
-        let oi_long_after = if order.side == OrderSide::Long {
-            oi_long.saturating_add(order.size_q)
-        } else {
-            oi_long
+        // Skew is the traders' net position, which the pool holds the other
+        // side of. The engine's long and short OI are always equal here (the
+        // pool mirrors every fill), so their difference says nothing.
+        let traders_net = match self
+            .portfolios
+            .get(&(order.market, Self::pool_owner()))
+            .and_then(|b| exchange::portfolio_from_bytes(b).ok())
+            .and_then(|pool| exchange::effective_position_q(g, &pool).ok())
+        {
+            Some(pool_pos) => -pool_pos,
+            None => return info.spread_bps,
         };
-        let oi_short_after = if order.side == OrderSide::Short {
-            oi_short.saturating_add(order.size_q)
-        } else {
-            oi_short
+        let signed = match i128::try_from(order.size_q) {
+            Ok(v) if order.side == OrderSide::Long => v,
+            Ok(v) => -v,
+            Err(_) => return policy::MAX_SPREAD_BPS,
         };
-        let net_oi_after = oi_long_after.abs_diff(oi_short_after);
+        let net_after = traders_net.saturating_add(signed).unsigned_abs();
+        let (spread_min_tier, _, _) = match info.tier {
+            Tier::Major => (MAJOR_SPREAD_MIN_BPS, 0, 0),
+            Tier::LongTail => (LONGTAIL_SPREAD_MIN_BPS, 0, 0),
+        };
+        // Spec §5: a trade that reduces skew pays only `spread_min`.
+        if net_after < traders_net.unsigned_abs() {
+            return spread_min_tier;
+        }
+        let net_oi_after = net_after;
 
         let (spread_min, k_skew, k_size) = match info.tier {
             Tier::Major => (MAJOR_SPREAD_MIN_BPS, MAJOR_K_SKEW_BPS, MAJOR_K_SIZE_BPS),
@@ -1772,6 +1944,94 @@ impl Neap {
             }
         }
         self.fee_ledgers.flush();
+    }
+
+    /// Order sizes are checked against `MAX_SIZE_Q` when placed; this is the
+    /// second line of defence against a wrapping cast.
+    fn signed_size(side: OrderSide, size_q: u128) -> i128 {
+        let v = i128::try_from(size_q).unwrap_or_else(|_| env::panic_str("size too large"));
+        if side == OrderSide::Long {
+            v
+        } else {
+            -v
+        }
+    }
+
+    /// Which fills a market mode allows. Opens need `Active`; `ReduceOnly`
+    /// fills closes; nothing fills in any other mode.
+    fn require_fill_allowed(mode: Mode, reduce_only: bool) {
+        match mode {
+            Mode::Active => {}
+            Mode::ReduceOnly => require!(reduce_only, "market is reduce-only"),
+            _ => env::panic_str("market does not allow fills in this mode"),
+        }
+    }
+
+    /// Refuse to act on a price that is an hour or more old.
+    fn require_price_usable(info: &Market, what: &str) {
+        let age_ns = env::block_timestamp().saturating_sub(info.observation.source_ts);
+        require!(
+            policy::observation_staleness(age_ns) < StalenessLevel::PriceUncertain,
+            format!("price uncertain: no {what}")
+        );
+    }
+
+    /// OI caps for a position-increasing fill, shared by orders and
+    /// conditionals. The pool mirrors every trade, so the engine's long and
+    /// short OI are always equal; what the caps bound is the traders' net
+    /// position per side (the pool's exposure). A fill that shrinks that net
+    /// is never refused.
+    fn check_oi_caps(
+        g: &Group,
+        info: &Market,
+        p: &PortfolioAccountV16Account,
+        pool: &PortfolioAccountV16Account,
+        size_q_signed: i128,
+    ) {
+        let traders_net = -ok(exchange::effective_position_q(g, pool));
+        let after = traders_net.saturating_add(size_q_signed);
+        if after.unsigned_abs() > traders_net.unsigned_abs() {
+            if after > 0 {
+                require!(
+                    policy::oi_within_cap(after.unsigned_abs(), info.oi_cap_long),
+                    "long OI cap exceeded"
+                );
+            } else {
+                require!(
+                    policy::oi_within_cap(after.unsigned_abs(), info.oi_cap_short),
+                    "short OI cap exceeded"
+                );
+            }
+        }
+        if info.per_account_cap != 0 {
+            let pos = ok(exchange::effective_position_q(g, p));
+            let new_abs = pos.saturating_add(size_q_signed).unsigned_abs();
+            require!(
+                policy::oi_within_cap(new_abs, info.per_account_cap),
+                "per-account cap exceeded"
+            );
+        }
+    }
+
+    fn symbol_ok(symbol: &str) -> bool {
+        !symbol.is_empty()
+            && symbol.len() <= MAX_SYMBOL_LEN
+            && symbol
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'/'))
+    }
+
+    fn price_source_ok(src: &PriceSource) -> bool {
+        match src {
+            PriceSource::Tee { pools, .. } => {
+                !pools.is_empty()
+                    && pools.len() <= MAX_TEE_POOLS
+                    && pools
+                        .iter()
+                        .all(|p| !p.is_empty() && p.len() <= MAX_TEE_POOL_ID_LEN)
+            }
+            _ => true,
+        }
     }
 
     /// C-1 fix: require the market is Active or ReduceOnly.
@@ -1895,6 +2155,9 @@ impl Neap {
         let pool = self.load_pool(market);
         let mut meta = info.meta();
         ok(exchange::catch_up(&mut g, &mut meta, &pool, slot()));
+        // Refuse to act on a market whose funding and price path stop short of
+        // the current block; `crank` works the backlog down first.
+        ok(exchange::require_caught_up(&g, slot()));
         info.set_meta(meta);
         (g, info, pool)
     }

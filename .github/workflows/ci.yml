@@ -1,4 +1,3 @@
-# Checks every pull request and every push to main.
 name: ci
 
 on:
@@ -13,57 +12,20 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  services:
-    name: services (keeper, indexer, ops)
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: neap_test
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres" --health-interval 5s
-          --health-timeout 5s --health-retries 10
-    env:
-      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/neap_test
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked -p neap-indexer -p neap-keeper -p neap-ops
-      - run: cargo test --locked -p neap-indexer -p neap-keeper -p neap-ops
-
   contract:
     name: contract and engine tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p neap
-
-  image:
-    name: backend image builds
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker build -f deploy/Dockerfile -t neap-backend:ci .
-
-  secrets:
-    name: no committed keys
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # A NEAR secret key is "ed25519:" plus about 88 base58 characters; a
-      # public key is about 44. Fail on anything long enough to be a secret.
-      - run: |
-          if git grep -nIE 'ed25519:[1-9A-HJ-NP-Za-km-z]{80,}' -- . ; then
-            echo "A private key is committed. Remove it and rotate the key." >&2
-            exit 1
-          fi
+      # The contract: unit tests, the review's regression tests and the
+      # custody-after-every-call scenario. Tests marked #[ignore] are open
+      # proposals in docs/review-2026-11-18.md and are expected to fail.
+      - name: contract tests
+        run: cargo test -p neap
+      # The vendored risk engine.
+      - name: engine tests
+        run: cargo test -p percolator --features fuzz

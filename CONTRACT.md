@@ -12,26 +12,14 @@
 | `ops.neap-trade.testnet` | LP provider, trader | Seeded the pool with 50 USDC |
 | `usdc.fakes.testnet` | Quote token (USDC) | Standard NEAR testnet fake USDC, 6 decimals |
 
-## Access for Amalnath
+## Access
 
-Amal's full-access key on `neap-trade.testnet`:
-
-- **Public key:** `ed25519:DvT51sFiedZNjz1tRP4Ve2L6n8C27bYMcRwnAzjwysjn`
-- **Private key and seed phrase:** removed from this file on 2026-11-18. They were committed here and
-  are still in git history, so treat this key as public: delete it from the account (command below)
-  and add a fresh one. Share keys through a password manager, never the repo.
-
-To import into CLI:
+Keys are never written in this repo. The full-access key that used to be printed here is compromised (it is
+still in git history): delete it from `neap-trade.testnet` and add a fresh one, shared out of band.
 
 ```bash
-near account import-account using-private-key ed25519:<your-private-key> network-config testnet
-```
-
-This key has **full access** to the contract account (owner powers: create markets, push prices, set admin roles). To revoke later:
-
-```bash
-near account delete-key neap-trade.testnet ed25519:DvT51sFiedZNjz1tRP4Ve2L6n8C27bYMcRwnAzjwysjn \
-  network-config testnet sign-with-keychain send
+near account list-keys neap-trade.testnet network-config testnet now
+near account delete-key neap-trade.testnet <old-public-key> network-config testnet sign-with-keychain send
 ```
 
 ## Market: NEAR-PERP (market_id = 0)
