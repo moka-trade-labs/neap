@@ -126,6 +126,8 @@ Contract
 Market
   symbol, tier, mode (Proposed | Active | ReduceOnly | PriceUncertain | Recovery | WindDown | Closed)
   price_source: NearPool{dex, pool_id, quote_pool?} | Tee{chain, pools[]}
+  base_decimals: u8 (NearPool only; `CreateMarket.base_decimals`, default 6, max 24; stored per market.
+                 Pool price = usdc_atoms * 10^base_decimals / token_atoms, rounded down)
                 | Pushed   // transitional (steps 1.1-1.2): the trusted `oracle` account; deleted in 1.3
   observation: {price_e6, liquidity_usd, source_ts, seq, block}
   ema_e6, engine_target, staircase state

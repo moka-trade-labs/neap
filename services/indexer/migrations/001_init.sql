@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS observations (
     ts          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_obs_market_block ON observations(market_id, block);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_market_seq ON observations(market_id, seq);
 
 CREATE TABLE IF NOT EXISTS candles (
     market_id   INTEGER NOT NULL REFERENCES markets(id),
@@ -103,4 +104,10 @@ CREATE TABLE IF NOT EXISTS fee_claims (
     amount      TEXT NOT NULL,
     block       BIGINT NOT NULL,
     ts          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Receipts already indexed (block feed and POST /tx can overlap).
+CREATE TABLE IF NOT EXISTS seen_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    seen_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );

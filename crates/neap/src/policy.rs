@@ -300,3 +300,23 @@ impl Custody {
         wallets.checked_add(vaults)
     }
 }
+
+
+/// Largest base-token decimals the pool reader accepts (NEAR-native tokens use 24).
+pub const MAX_BASE_DECIMALS: u8 = 24;
+
+/// Spot price of one whole base token in `price_e6` from constant-product pool
+/// reserves: `usdc_atoms * 10^base_decimals / token_atoms` (USDC has 6
+/// decimals, so the result is already scaled by 1e6). Rounds down. `None` on
+/// zero reserves, overflow, a zero result or a price above [`MAX_PRICE`].
+pub fn pool_price_e6(usdc_atoms: u128, token_atoms: u128, base_decimals: u8) -> Option<u64> {
+    if usdc_atoms == 0 || token_atoms == 0 || base_decimals > MAX_BASE_DECIMALS {
+        return None;
+    }
+    let scale = 10u128.checked_pow(base_decimals as u32)?;
+    let p = usdc_atoms.checked_mul(scale)? / token_atoms;
+    match u64::try_from(p) {
+        Ok(p) if p > 0 && p <= MAX_PRICE => Some(p),
+        _ => None,
+    }
+}

@@ -16,7 +16,11 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value> {
-    let resp = client.get(url).send().await?;
+    let mut req = client.get(url);
+    if let Some(k) = crate::config::fastnear_key() {
+        req = req.bearer_auth(k);
+    }
+    let resp = req.send().await?;
     let status = resp.status();
     if !status.is_success() {
         return Err(anyhow!("{url}: HTTP {status}"));
@@ -86,72 +90,85 @@ pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) ->
     let base = config.neardata_url.trim_end_matches('/').to_string();
     let interval = std::time::Duration::from_millis(config.poll_interval_ms);
 
+    // A different contract than last run: the stored rows belong to the old one.
+    if db::get_state(&pool, "contract").await?.as_deref() != Some(config.contract_id.as_str()) {
+        db::reset_for_contract(&pool, &config.contract_id).await?;
+        info!(contract = %config.contract_id, "contract changed, indexer tables reset");
+    }
+
+    let head = loop {
+        match latest_block(&client, &base).await {
+            Ok(h) => break h,
+            Err(e) => {
+                warn!(err = %e, "neardata unreachable, retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    };
     let mut cursor = db::get_last_block(&pool).await?;
     if cursor == 0 && config.start_block > 0 {
         cursor = config.start_block - 1;
     }
     if cursor == 0 {
-        loop {
-            match latest_block(&client, &base).await {
-                Ok(h) => {
-                    cursor = h;
-                    break;
-                }
-                Err(e) => {
-                    warn!(err = %e, "neardata unreachable, retrying");
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                }
-            }
-        }
+        cursor = head;
         info!(block = cursor, "starting from latest block");
+    } else if head.saturating_sub(cursor) > config.max_catchup_blocks {
+        // Display-only data: skipping a long gap beats hammering the free block API.
+        warn!(cursor, head, "too far behind, jumping to head");
+        cursor = head;
     } else {
-        info!(block = cursor, "resuming from saved cursor");
+        info!(block = cursor, head, "resuming from saved cursor");
     }
 
+    // neardata long-polls for blocks that are not produced yet, so one request
+    // per block follows the chain head without polling `last_block`.
+    let mut since_save = 0u32;
     loop {
-        let head = match latest_block(&client, &base).await {
-            Ok(h) => h,
+        let h = cursor + 1;
+        match fetch_block(&client, &base, &config.contract_id, h).await {
+            Ok(Some(be)) => {
+                let mut fresh: std::collections::HashMap<&str, bool> = Default::default();
+                for (rid, ev) in &be.events {
+                    if !fresh.contains_key(rid.as_str()) {
+                        let f = db::mark_receipt(&pool, rid).await.unwrap_or(true);
+                        fresh.insert(rid.as_str(), f);
+                    }
+                    if !fresh[rid.as_str()] {
+                        continue;
+                    }
+                    if let Err(e) = db::process_event(&pool, ev, h, be.ts).await {
+                        error!(block = h, event = %ev.event, err = %e, "db write failed");
+                    }
+                    let msg = serde_json::json!({
+                        "event": ev.event,
+                        "data": ev.data,
+                        "block": h,
+                        "ts": be.ts,
+                        "receipt_id": rid,
+                    });
+                    let _ = tx.send(msg.to_string());
+                }
+                cursor = h;
+                since_save += 1;
+                if !be.events.is_empty() || since_save >= 20 {
+                    db::set_last_block(&pool, cursor).await?;
+                    since_save = 0;
+                }
+                // Stay under the free tier (~180 req/min) even while catching up.
+                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            }
+            Ok(None) => cursor = h,
             Err(e) => {
-                warn!(err = %e, "failed to fetch latest block");
-                tokio::time::sleep(interval).await;
-                continue;
-            }
-        };
-        if head.saturating_sub(cursor) > 50 {
-            info!(cursor, head, lag = head - cursor, "catching up");
-        }
-
-        while cursor < head {
-            let h = cursor + 1;
-            match fetch_block(&client, &base, &config.contract_id, h).await {
-                Ok(Some(be)) => {
-                    for (rid, ev) in &be.events {
-                        if let Err(e) = db::process_event(&pool, ev, h, be.ts).await {
-                            error!(block = h, event = %ev.event, err = %e, "db write failed");
-                        }
-                        let msg = serde_json::json!({
-                            "event": ev.event,
-                            "data": ev.data,
-                            "block": h,
-                            "ts": be.ts,
-                            "receipt_id": rid,
-                        });
-                        let _ = tx.send(msg.to_string());
+                warn!(block = h, err = %e, "block fetch failed, retrying");
+                tokio::time::sleep(interval.max(std::time::Duration::from_secs(6))).await;
+                // If the block API keeps refusing us, don't build a backlog we can never clear.
+                if let Ok(head) = latest_block(&client, &base).await {
+                    if head.saturating_sub(cursor) > config.max_catchup_blocks {
+                        warn!(cursor, head, "too far behind, jumping to head");
+                        cursor = head;
                     }
-                    cursor = h;
-                    if !be.events.is_empty() {
-                        db::set_last_block(&pool, cursor).await?;
-                    }
-                }
-                Ok(None) => cursor = h,
-                Err(e) => {
-                    warn!(block = h, err = %e, "block fetch failed, retrying");
-                    tokio::time::sleep(interval).await;
-                    break;
                 }
             }
         }
-        db::set_last_block(&pool, cursor).await?;
-        tokio::time::sleep(interval).await;
     }
 }

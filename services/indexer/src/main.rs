@@ -12,6 +12,7 @@ mod config;
 mod db;
 mod events;
 mod fetcher;
+mod ingest;
 
 use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;
@@ -87,6 +88,7 @@ async fn main() -> Result<()> {
         live,
         keeper_url: std::env::var("KEEPER_INTERNAL_URL").ok(),
         http: reqwest::Client::new(),
+        ingest: Arc::new(tokio::sync::Semaphore::new(16)),
     };
     let app = api::router(state);
     let addr = format!("0.0.0.0:{}", config.api_port);

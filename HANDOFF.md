@@ -158,26 +158,43 @@ Steps 1.7 (conditional orders), 1.8 (fees), 1.9 (admin roles) implemented. 48 te
 
 Next: 1.10 keeper (off-chain), 1.11 indexer + API, 1.12 security gate + mainnet deploy.
 
-## 2026-11-18: production-readiness review of the contract
+## 2026-11-13: backend deployed (keeper + indexer + API), path 1 live on testnet
 
-Six parallel reviews (accounting, risk math, oracle and orders, NEAR platform, access and upgrades, coverage).
-Everything is in `docs/review-2026-11-18.md`; raw reviewer notes are in `docs/review-2026-11-18/`.
+Where things run and which accounts exist: `deploy/TESTNET.md`. API reference: `services/indexer/README.md`.
 
-Changed in this PR (each has a regression test in `crates/neap/tests/poc_*.rs` or `cov_*.rs`):
-- `liquidate` takes the caller's 60% out of engine insurance before crediting it (custody invariant).
-- Fills obey the market mode in both `execute_order` and `execute_conditional`; conditionals obey OI caps.
-- OI caps and the dynamic spread use the traders' net position (the pool's exposure), not the mirrored engine OI.
-- Order sizes above `i128::MAX` are refused. TP/SL clamp to the remaining position. Zero-limit buys are refused.
-- Everything except `crank` requires the market to be caught up to the current block.
-- `withdraw_margin` (with a position), `lp_deposit` / `lp_redeem` (pool exposed) and `keeper_step` refuse prices
-  an hour old or more. `deposit` works in `PriceUncertain`.
-- `push_price` is refused on `NearPool` markets. `on_price_read` takes one sample per block and no longer
-  freezes after a move of more than 20%.
-- Admin methods need 1 yoctoNEAR. Stranger `Major` listings, bad symbols and oversized price sources are refunded.
-- `quote` rounds the fee up like the engine. New events: wallet/margin/LP moves and admin changes.
-- CI workflow added. The committed testnet key was removed from `CONTRACT.md` (rotate it).
+What changed in the services:
+- Keeper runs three independent loops (price, orders, liquidations). Orders are picked up every second;
+  if the last observation is not newer than the request, the keeper asks for one first (push or
+  `refresh_price`) and then executes. Conditionals are only sent when the mark is within 0.3% of the trigger.
+- Keeper auto-discovers markets, pushes a live Coinbase/Kraken price to `Pushed` markets, calls
+  `refresh_price` on `NearPool` markets, and activates `Proposed` markets once they have an observation.
+- Indexer has two event paths: the neardata block feed (rate-limited from Render, treat as a backup) and
+  `POST /tx {hash, signer_id}`, which reads the transaction outcome over JSON-RPC. The keeper reports its own
+  transactions; the frontend must report each wallet transaction. Receipts are de-duplicated (`seen_receipts`).
+- Prices, market state and candles come from a 3 s `get_market` poll, not from events.
+- Transactions are sent with `wait_until: INCLUDED`, so a keeper log line "sent" does not prove success.
 
-Callers must change: admin calls attach 1 yocto; after a long idle gap call `crank` until it stops making progress.
+Known gaps (not fixed, by priority):
+1. Liquidation scan is naive: it takes accounts from the indexer (`/accounts`, so only accounts whose
+   fills were indexed) and sends `liquidate` for every open position, relying on the contract to refuse.
+   Needs an account enumeration view or an off-chain health check.
+2. A user transaction the frontend never reports is only indexed if the block feed happens to work.
+   A FastNEAR API key (`FASTNEAR_API_KEY` in Render) makes the block feed reliable.
+3. `convert_pnl_for` does not exist, so the keeper cannot auto-convert profit on close (decision F-1).
+4. Permissionless `Pushed` markets cannot activate (only the owner path creates them); fine for path 1.
+5. `base_decimals` is lister-supplied and unchecked; a wrong value misprices the market.
+6. The first deployment's key is committed in `CONTRACT.md`. Rotate it and purge it before mainnet.
+7. Free Render instance and free Postgres (expires 2026-12-13); public RPCs with failover, no paid key.
+8. Path 2 (Solana tokens through a TEE oracle, opening and creating from Solana) is not started in the
+   services: `oracle-agent` and `relayer` are skeletons.
 
-Not done, waiting on jason (proposals P-1 to P-12 in the review doc). The `#[ignore]`d tests fail until decided.
-Not run here: Kani, the wasm build and the sandbox tests (tooling not installed in the review environment).
+## 2026-11-18: design review (docs only)
+
+- `docs/review/2026-11-18-design-review.md`: ranked findings on the product and mechanism design from a
+  five-seat committee (trader, LP, lister/attacker, risk skeptic, competitor). No code or spec changed.
+- `docs/review/2026-11-18-proposals.md`: seven **proposed** decisions (P1–P7). None is accepted. Each needs
+  jason's answer, then a dated entry in `docs/decisions.md` and a spec diff before code.
+- Shortest list items 1–4 (bound the listing surface, fix the mark, unconditional exits, pay LPs) implement the
+  existing spec and do not reverse a decision.
+- Passed to the contract audit, not verified here: the liquidator payout in `liquidate` leaves custody without
+  an engine insurance withdrawal (`contract.rs:1580`).

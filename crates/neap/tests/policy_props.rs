@@ -105,3 +105,26 @@ fn skew_funding_bounded_signed_and_saturating() {
         }
     }
 }
+
+
+#[test]
+fn pool_price_scales_by_base_decimals() {
+    // 6-decimal token: 100k TIDE vs 250k USDC = $2.50.
+    assert_eq!(pool_price_e6(250_000_000_000, 100_000_000_000, 6), Some(2_500_000));
+    // 24-decimal wNEAR: 3,500 USDC vs 1,000 wNEAR = $3.50.
+    assert_eq!(
+        pool_price_e6(3_500_000_000, 1_000 * 10u128.pow(24), 24),
+        Some(3_500_000)
+    );
+    // 18-decimal token at $0.000123.
+    assert_eq!(pool_price_e6(123_000_000, 1_000_000 * 10u128.pow(18), 18), Some(123));
+    // 8-decimal wBTC at $90,000.
+    assert_eq!(pool_price_e6(900_000_000_000, 10 * 10u128.pow(8), 8), Some(90_000_000_000));
+    // Rejections: zero reserves, absurd decimals, overflow, price out of range.
+    assert_eq!(pool_price_e6(0, 1, 6), None);
+    assert_eq!(pool_price_e6(1, 0, 6), None);
+    assert_eq!(pool_price_e6(1, 1, 25), None);
+    assert_eq!(pool_price_e6(u128::MAX / 2, 1, 24), None);
+    assert_eq!(pool_price_e6(10u128.pow(20), 1, 6), None);
+    assert_eq!(pool_price_e6(1, 10u128.pow(30), 6), None);
+}

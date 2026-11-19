@@ -12,15 +12,15 @@ services:
     autoDeploy: true
     envVars:
       - key: NEAP_CONTRACT
-        value: neap-trade.testnet
+        value: neap-perps.testnet
       - key: NEAP_SIGNER
-        value: neap-trade.testnet
+        value: neap-oracle.testnet
       - key: NEAP_SIGNER_KEY
         sync: false # paste the oracle account's private key (ed25519:...) in the dashboard
-      - key: NEAR_RPC_URL
-        value: https://test.rpc.fastnear.com
+      - key: FASTNEAR_API_KEY
+        sync: false # free key from dashboard.fastnear.com; lifts RPC + neardata rate limits
       - key: NEAP_LOOP_MS
-        value: "3000"
+        value: "1000"
       - key: FAUCET_TOKEN
         value: usdc.fakes.testnet
       - key: FAUCET_AMOUNT
