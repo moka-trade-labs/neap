@@ -511,7 +511,7 @@ fn oi_cap_blocks_oversized_order() {
     let (mut e, mut c) = setup();
     let bob = setup_bob(&mut e, &mut c);
     // Set a tight OI cap: 5 units.
-    e.call(&accounts(0), NearToken::from_yoctonear(0));
+    e.call(&accounts(0), NearToken::from_yoctonear(1));
     c.set_oi_caps(0, U128(5 * POS_SCALE), U128(5 * POS_SCALE), U128(0));
     // Try to open 10 units (exceeds cap).
     e.call(&bob, ONE);
@@ -527,7 +527,7 @@ fn oi_cap_blocks_oversized_order() {
 fn oi_cap_allows_within_limit() {
     let (mut e, mut c) = setup();
     let bob = setup_bob(&mut e, &mut c);
-    e.call(&accounts(0), NearToken::from_yoctonear(0));
+    e.call(&accounts(0), NearToken::from_yoctonear(1));
     c.set_oi_caps(0, U128(100 * POS_SCALE), U128(100 * POS_SCALE), U128(0));
     // 10 units within 100 cap.
     request_and_fill(&mut e, &mut c, &bob, OrderSide::Long, 10 * POS_SCALE, u64::MAX, false);
@@ -753,11 +753,11 @@ fn admin_set_mode_tightens_only() {
     let (mut e, mut c) = setup();
     let owner = accounts(0);
     // Active → ReduceOnly: allowed.
-    e.call(&owner, NearToken::from_yoctonear(0));
+    e.call(&owner, NearToken::from_yoctonear(1));
     c.set_mode(0, Mode::ReduceOnly);
     assert_eq!(c.get_market(0).mode, Mode::ReduceOnly);
     // ReduceOnly → PriceUncertain: allowed.
-    e.call(&owner, NearToken::from_yoctonear(0));
+    e.call(&owner, NearToken::from_yoctonear(1));
     c.set_mode(0, Mode::PriceUncertain);
     assert_eq!(c.get_market(0).mode, Mode::PriceUncertain);
 }
@@ -767,10 +767,10 @@ fn admin_set_mode_tightens_only() {
 fn admin_cannot_loosen_mode() {
     let (mut e, mut c) = setup();
     let owner = accounts(0);
-    e.call(&owner, NearToken::from_yoctonear(0));
+    e.call(&owner, NearToken::from_yoctonear(1));
     c.set_mode(0, Mode::ReduceOnly);
     // Try to go back to Active: should fail.
-    e.call(&owner, NearToken::from_yoctonear(0));
+    e.call(&owner, NearToken::from_yoctonear(1));
     c.set_mode(0, Mode::Active);
 }
 
@@ -779,10 +779,10 @@ fn pauser_can_tighten_mode() {
     let (mut e, mut c) = setup();
     let owner = accounts(0);
     let pauser: AccountId = "pauser.near".parse().unwrap();
-    e.call(&owner, NearToken::from_yoctonear(0));
+    e.call(&owner, NearToken::from_yoctonear(1));
     c.set_pauser(Some(pauser.clone()));
 
-    e.call(&pauser, NearToken::from_yoctonear(0));
+    e.call(&pauser, NearToken::from_yoctonear(1));
     c.set_mode(0, Mode::ReduceOnly);
     assert_eq!(c.get_market(0).mode, Mode::ReduceOnly);
 }
@@ -791,7 +791,7 @@ fn pauser_can_tighten_mode() {
 #[should_panic(expected = "only the owner or pauser")]
 fn stranger_cannot_set_mode() {
     let (mut e, mut c) = setup();
-    e.call(&accounts(4), NearToken::from_yoctonear(0));
+    e.call(&accounts(4), NearToken::from_yoctonear(1));
     c.set_mode(0, Mode::ReduceOnly);
 }
 
@@ -808,11 +808,11 @@ fn admin_methods_do_not_change_balances() {
 
     // Admin: set_mode, set_oi_caps, set_pauser.
     let owner = accounts(0);
-    e.call(&owner, NearToken::from_yoctonear(0));
+    e.call(&owner, NearToken::from_yoctonear(1));
     c.set_mode(0, Mode::ReduceOnly);
-    e.call(&owner, NearToken::from_yoctonear(0));
+    e.call(&owner, NearToken::from_yoctonear(1));
     c.set_oi_caps(0, U128(999), U128(999), U128(999));
-    e.call(&owner, NearToken::from_yoctonear(0));
+    e.call(&owner, NearToken::from_yoctonear(1));
     c.set_pauser(Some("p.near".parse().unwrap()));
 
     // Verify nothing changed.
