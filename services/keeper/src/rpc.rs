@@ -47,9 +47,14 @@ impl NearRpc {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
             .build()?;
+        let rpc_urls: Vec<String> =
+            rpc_url.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
+        if rpc_urls.is_empty() {
+            return Err(anyhow!("NEAR_RPC_URL holds no RPC endpoint"));
+        }
         let rpc = Self {
             client,
-            rpc_urls: rpc_url.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect(),
+            rpc_urls,
             rpc_idx: Default::default(),
             contract_id,
             signer_id: signer_account,
@@ -72,7 +77,9 @@ impl NearRpc {
             "public_key": pk,
         })).await?;
         let nonce = resp["nonce"].as_u64().context("no nonce")?;
-        self.nonce.store(nonce, Ordering::SeqCst);
+        // Never move backwards: `final` state lags the transactions still in
+        // flight, and reusing one of their nonces gets the next sends rejected.
+        self.nonce.fetch_max(nonce, Ordering::SeqCst);
 
         let hash_str = resp["block_hash"].as_str().context("no block_hash")?;
         let hash = CryptoHash::from_str(hash_str)
@@ -173,10 +180,8 @@ impl NearRpc {
         if let Some(err) = resp.get("status").and_then(|s| s.get("Failure")) {
             return Err(anyhow!("{method} tx failed: {err}"));
         }
-        let hash = resp["transaction"]["hash"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+        // The hash is known locally; an INCLUDED response need not carry it.
+        let hash = tx_hash.to_string();
         // Price updates are read from views; everything else carries events.
         let quiet = matches!(method.as_str(), "push_price" | "refresh_price" | "crank");
         if let (Some(base), false, true) = (&self.notify, quiet, receiver == &self.contract_id) {
@@ -209,8 +214,8 @@ impl NearRpc {
         let signature = self.signer.secret_key.sign(tx_hash.as_ref());
         let signed = near_primitives::transaction::SignedTransaction::new(signature, tx);
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, borsh::to_vec(&signed)?);
-        let resp = self.send_tx(&tx_b64).await?;
-        Ok(resp["transaction"]["hash"].as_str().unwrap_or("unknown").to_string())
+        self.send_tx(&tx_b64).await?;
+        Ok(tx_hash.to_string())
     }
 
     /// Whether an account exists on chain.
@@ -229,8 +234,16 @@ impl NearRpc {
         }
     }
 
-    pub fn signer_id(&self) -> &AccountId {
-        &self.signer_id
+    /// The signer's balance in yoctoNEAR.
+    pub async fn signer_balance(&self) -> Result<u128> {
+        let v = self
+            .rpc_call("query", json!({
+                "request_type": "view_account",
+                "finality": "final",
+                "account_id": self.signer_id.to_string(),
+            }))
+            .await?;
+        v["amount"].as_str().and_then(|s| s.parse().ok()).context("no balance in view_account")
     }
 
     /// Broadcast a signed tx and wait for execution. A rate-limited or
@@ -294,10 +307,9 @@ impl NearRpc {
         let limited = resp.status().as_u16() == 429 || resp.status().is_server_error();
         let resp: Value = resp.json().await.map_err(|e| (true, e.into()))?;
         if let Some(err) = resp.get("error") {
-            let es = err.to_string();
+            let es = err.to_string().to_lowercase();
             let rotate = limited
                 || es.contains("429")
-                || es.contains("Rate limit")
                 || es.contains("rate limit")
                 || es.contains("-32601")
                 || es.contains("timeout")

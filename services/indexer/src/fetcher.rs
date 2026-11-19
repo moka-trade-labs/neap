@@ -82,6 +82,25 @@ async fn fetch_block(
     Ok(Some(BlockEvents { ts, events: out }))
 }
 
+const MIN_BLOCK_PERIOD: std::time::Duration = std::time::Duration::from_millis(350);
+
+/// Where to resume. Returns the cursor (last block already handled) and, when
+/// a gap is skipped, the inclusive block range that was given up on.
+///
+/// - Saved cursor close to head: resume from it.
+/// - Saved cursor more than `max_catchup` behind: jump to head, report the gap.
+/// - Empty database with `START_BLOCK`: start there, however far back it is.
+/// - Empty database otherwise: start at head.
+fn start_cursor(saved: u64, start_block: u64, head: u64, max_catchup: u64) -> (u64, Option<(u64, u64)>) {
+    if saved == 0 {
+        return if start_block > 0 { (start_block - 1, None) } else { (head, None) };
+    }
+    if head.saturating_sub(saved) > max_catchup {
+        return (head, Some((saved + 1, head)));
+    }
+    (saved, None)
+}
+
 /// Run the block fetcher loop. Sends events to the broadcast channel for WS.
 pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) -> Result<()> {
     let client = reqwest::Client::builder()
@@ -90,10 +109,21 @@ pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) ->
     let base = config.neardata_url.trim_end_matches('/').to_string();
     let interval = std::time::Duration::from_millis(config.poll_interval_ms);
 
-    // A different contract than last run: the stored rows belong to the old one.
-    if db::get_state(&pool, "contract").await?.as_deref() != Some(config.contract_id.as_str()) {
-        db::reset_for_contract(&pool, &config.contract_id).await?;
-        info!(contract = %config.contract_id, "contract changed, indexer tables reset");
+    // A different contract than last run: the stored rows belong to the old
+    // one. Wiping them takes an explicit switch, so a typo in NEAP_CONTRACT
+    // cannot erase history that the block feed can no longer replay.
+    match db::get_state(&pool, "contract").await?.as_deref() {
+        Some(c) if c == config.contract_id => {}
+        Some(old) if std::env::var("RESET_ON_CONTRACT_CHANGE").as_deref() != Ok("1") => {
+            return Err(anyhow!(
+                "database holds data for {old}, not {}; set RESET_ON_CONTRACT_CHANGE=1 to wipe it",
+                config.contract_id
+            ));
+        }
+        _ => {
+            db::reset_for_contract(&pool, &config.contract_id).await?;
+            info!(contract = %config.contract_id, "indexer tables reset for this contract");
+        }
     }
 
     let head = loop {
@@ -105,19 +135,14 @@ pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) ->
             }
         }
     };
-    let mut cursor = db::get_last_block(&pool).await?;
-    if cursor == 0 && config.start_block > 0 {
-        cursor = config.start_block - 1;
-    }
-    if cursor == 0 {
-        cursor = head;
-        info!(block = cursor, "starting from latest block");
-    } else if head.saturating_sub(cursor) > config.max_catchup_blocks {
+    let saved = db::get_last_block(&pool).await?;
+    let (mut cursor, skipped) = start_cursor(saved, config.start_block, head, config.max_catchup_blocks);
+    if let Some((from, to)) = skipped {
         // Display-only data: skipping a long gap beats hammering the free block API.
-        warn!(cursor, head, "too far behind, jumping to head");
-        cursor = head;
+        warn!(from, to, "too far behind, jumping to head; range recorded in skipped_ranges");
+        db::record_skipped(&pool, from, to).await?;
     } else {
-        info!(block = cursor, head, "resuming from saved cursor");
+        info!(block = cursor, head, "block fetcher starting");
     }
 
     // neardata long-polls for blocks that are not produced yet, so one request
@@ -125,28 +150,48 @@ pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) ->
     let mut since_save = 0u32;
     loop {
         let h = cursor + 1;
+        let started = std::time::Instant::now();
         match fetch_block(&client, &base, &config.contract_id, h).await {
             Ok(Some(be)) => {
-                let mut fresh: std::collections::HashMap<&str, bool> = Default::default();
+                // Group by receipt: each receipt is written in one transaction.
+                let mut order: Vec<&str> = Vec::new();
+                let mut by_receipt: std::collections::HashMap<&str, Vec<&events::NeapEvent>> = Default::default();
                 for (rid, ev) in &be.events {
-                    if !fresh.contains_key(rid.as_str()) {
-                        let f = db::mark_receipt(&pool, rid).await.unwrap_or(true);
-                        fresh.insert(rid.as_str(), f);
+                    if !by_receipt.contains_key(rid.as_str()) {
+                        order.push(rid.as_str());
                     }
-                    if !fresh[rid.as_str()] {
+                    by_receipt.entry(rid.as_str()).or_default().push(ev);
+                }
+                for rid in order {
+                    let evs = &by_receipt[rid];
+                    // Retry transient database errors; an unwritten receipt stays
+                    // unmarked, so `POST /tx` can still index it later.
+                    let mut written = false;
+                    for attempt in 1..=3u32 {
+                        match db::index_receipt(&pool, rid, evs, h, be.ts).await {
+                            Ok(fresh) => {
+                                written = fresh;
+                                break;
+                            }
+                            Err(e) => {
+                                error!(block = h, receipt = rid, attempt, err = %e, "receipt write failed");
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+                    if !written {
                         continue;
                     }
-                    if let Err(e) = db::process_event(&pool, ev, h, be.ts).await {
-                        error!(block = h, event = %ev.event, err = %e, "db write failed");
+                    for ev in evs {
+                        let msg = serde_json::json!({
+                            "event": ev.event,
+                            "data": ev.data,
+                            "block": h,
+                            "ts": be.ts,
+                            "receipt_id": rid,
+                        });
+                        let _ = tx.send(msg.to_string());
                     }
-                    let msg = serde_json::json!({
-                        "event": ev.event,
-                        "data": ev.data,
-                        "block": h,
-                        "ts": be.ts,
-                        "receipt_id": rid,
-                    });
-                    let _ = tx.send(msg.to_string());
                 }
                 cursor = h;
                 since_save += 1;
@@ -154,8 +199,12 @@ pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) ->
                     db::set_last_block(&pool, cursor).await?;
                     since_save = 0;
                 }
-                // Stay under the free tier (~180 req/min) even while catching up.
-                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                // Stay under the free tier (~180 req/min) while catching up, without
+                // adding delay at the head, where the long-poll already paces us.
+                let spent = started.elapsed();
+                if spent < MIN_BLOCK_PERIOD {
+                    tokio::time::sleep(MIN_BLOCK_PERIOD - spent).await;
+                }
             }
             Ok(None) => cursor = h,
             Err(e) => {
@@ -164,11 +213,41 @@ pub async fn run(config: Config, pool: PgPool, tx: broadcast::Sender<String>) ->
                 // If the block API keeps refusing us, don't build a backlog we can never clear.
                 if let Ok(head) = latest_block(&client, &base).await {
                     if head.saturating_sub(cursor) > config.max_catchup_blocks {
-                        warn!(cursor, head, "too far behind, jumping to head");
+                        warn!(cursor, head, "too far behind, jumping to head; range recorded in skipped_ranges");
+                        if let Err(e) = db::record_skipped(&pool, cursor + 1, head).await {
+                            error!(err = %e, "could not record skipped range");
+                        }
                         cursor = head;
+                        db::set_last_block(&pool, cursor).await?;
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::start_cursor;
+
+    #[test]
+    fn resumes_from_a_recent_cursor() {
+        assert_eq!(start_cursor(1_000, 0, 1_100, 150), (1_000, None));
+    }
+
+    #[test]
+    fn records_the_gap_when_jumping_to_head() {
+        assert_eq!(start_cursor(1_000, 0, 2_000, 150), (2_000, Some((1_001, 2_000))));
+    }
+
+    #[test]
+    fn start_block_is_honoured_on_an_empty_database() {
+        // Previously this jumped to head, so START_BLOCK never took effect.
+        assert_eq!(start_cursor(0, 500, 2_000, 150), (499, None));
+    }
+
+    #[test]
+    fn empty_database_starts_at_head() {
+        assert_eq!(start_cursor(0, 0, 2_000, 150), (2_000, None));
     }
 }

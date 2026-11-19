@@ -13,6 +13,7 @@ mod db;
 mod events;
 mod fetcher;
 mod ingest;
+mod limit;
 
 use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;
@@ -36,6 +37,7 @@ async fn main() -> Result<()> {
     // Connect to Postgres and run the (idempotent, multi-statement) schema.
     let pool = PgPoolOptions::new()
         .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&config.database_url)
         .await?;
     sqlx::raw_sql(include_str!("../migrations/001_init.sql"))
@@ -49,10 +51,12 @@ async fn main() -> Result<()> {
     // Live market state from contract views (also seeds the markets table).
     let chain = chain::Chain::new(&config.rpc_url, &config.contract_id);
     let live: chain::LiveMarkets = Arc::new(RwLock::new(Vec::new()));
+    let live_at: chain::LiveAt = Default::default();
     tokio::spawn(chain::run_live_poller(
         chain.clone(),
         pool.clone(),
         live.clone(),
+        live_at.clone(),
         tx.clone(),
         std::time::Duration::from_millis(config.live_refresh_ms),
     ));
@@ -73,7 +77,10 @@ async fn main() -> Result<()> {
     // Keep a free-tier host awake by pinging our own public URL.
     if let Ok(url) = std::env::var("KEEPALIVE_URL").or_else(|_| std::env::var("RENDER_EXTERNAL_URL")) {
         tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(600)).await;
                 let _ = client.get(format!("{}/health", url.trim_end_matches('/'))).send().await;
@@ -89,6 +96,8 @@ async fn main() -> Result<()> {
         keeper_url: std::env::var("KEEPER_INTERNAL_URL").ok(),
         http: reqwest::Client::new(),
         ingest: Arc::new(tokio::sync::Semaphore::new(16)),
+        live_at,
+        guards: Arc::new(api::Guards::from_env()),
     };
     let app = api::router(state);
     let addr = format!("0.0.0.0:{}", config.api_port);

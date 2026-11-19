@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::contract;
 use crate::price;
 use crate::rpc::NearRpc;
+use crate::status::{now_ms, Status};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -35,6 +36,8 @@ struct MarketInfo {
     seq: u64,
     obs_block: u64,
     price: u64,
+    /// Last observation price (what the oracle last wrote), not the staircase price.
+    obs_price: u64,
 }
 
 fn num(v: &Value) -> u64 {
@@ -51,6 +54,7 @@ async fn market(rpc: &NearRpc, id: u32) -> Result<MarketInfo> {
         seq: num(&v["observation"]["seq"]),
         obs_block: num(&v["observation"]["block"]),
         price: num(&v["effective_price"]),
+        obs_price: num(&v["observation"]["price_e6"]),
     })
 }
 
@@ -70,7 +74,7 @@ async fn markets(rpc: &NearRpc, config: &Config) -> Vec<MarketInfo> {
 }
 
 /// Returns true when a price was pushed (push_price already catches the engine up, so no crank needed).
-async fn update_price(rpc: &NearRpc, config: &Config, http: &reqwest::Client, m: &MarketInfo) -> bool {
+async fn update_price(rpc: &NearRpc, config: &Config, http: &reqwest::Client, status: &Status, m: &MarketInfo) -> bool {
     if m.pushed {
         let sym = config
             .price_feeds
@@ -78,17 +82,21 @@ async fn update_price(rpc: &NearRpc, config: &Config, http: &reqwest::Client, m:
             .cloned()
             .unwrap_or_else(|| price::feed_symbol(&m.symbol));
         let px = if config.live_prices {
-            match price::usd_price_e6(http, &sym).await {
+            // Cross-check the sources. A refusal pushes nothing, so the
+            // contract's stale ladder takes over instead of a doubtful price.
+            let found = price::sources(http, &sym).await;
+            match price::decide(&found, m.obs_price, config.max_source_spread_bps, config.single_source_max_move_bps) {
                 Ok(p) => Some(p),
-                Err(e) => {
-                    warn!(market = m.id, sym, err = %e, "live price unavailable");
+                Err(why) => {
+                    status.price_refused();
+                    warn!(market = m.id, sym, why, "no price pushed");
                     None
                 }
             }
         } else {
-            None
+            // Dev mode (testnet only, enforced in Config): a fixed price.
+            (config.push_price_e6 > 0).then_some(config.push_price_e6)
         };
-        let px = px.or((config.push_price_e6 > 0).then_some(config.push_price_e6));
         if let Some(p) = px {
             match contract::push_price(rpc, m.id, p).await {
                 Ok(hash) => {
@@ -176,26 +184,32 @@ fn near_trigger(p: &Pending, mark: u64) -> bool {
 }
 
 /// Ask for a fresh observation on one market and wait until it is on chain.
-async fn prime(rpc: &NearRpc, config: &Config, http: &reqwest::Client, m: &MarketInfo) {
-    update_price(rpc, config, http, m).await;
+async fn prime(rpc: &NearRpc, config: &Config, http: &reqwest::Client, status: &Status, m: &MarketInfo) {
+    update_price(rpc, config, http, status, m).await;
     // Pushed: lands in the tx's own block. NearPool: the pool read comes back
     // two receipts later.
     let wait = if m.pushed { 1200 } else { 3000 };
     tokio::time::sleep(Duration::from_millis(wait)).await;
 }
 
-async fn order_loop(rpc: Arc<NearRpc>, config: Config, http: reqwest::Client) {
+/// Seconds after the first sighting at which attempt number `attempts`
+/// (0-based) may be sent: 0, 2, 6, 14, 30. An order that cannot fill (limit not
+/// met, margin short) used to be re-sent every second until it expired, which
+/// let anyone burn the keeper's gas at thirty transactions per order.
+fn attempt_due_secs(attempts: u32) -> u64 {
+    (1u64 << attempts.min(16)).saturating_sub(1) * 2
+}
+
+async fn order_loop(rpc: Arc<NearRpc>, config: Config, http: reqwest::Client, status: Arc<Status>) {
     let mut order_floor = 0u64;
-    let mut cond_floor = 0u64;
     let mut orders: HashMap<u64, Pending> = HashMap::new();
-    let mut conds: HashMap<u64, Pending> = HashMap::new();
-    let mut n: u64 = 0;
+    // order id → (first seen, attempts sent)
+    let mut tries: HashMap<u64, (std::time::Instant, u32)> = HashMap::new();
     loop {
-        n += 1;
-        // ── two-step orders: every pass ──
         let (ids, next) = pending_ids(&rpc, false, order_floor).await;
         order_floor = ids.iter().copied().min().unwrap_or(next);
         orders.retain(|id, _| ids.contains(id));
+        tries.retain(|id, _| ids.contains(id));
         let mut by_market: HashMap<u32, Vec<(u64, u64)>> = HashMap::new();
         for id in ids {
             if !orders.contains_key(&id) {
@@ -203,16 +217,20 @@ async fn order_loop(rpc: Arc<NearRpc>, config: Config, http: reqwest::Client) {
                     orders.insert(id, p);
                 }
             }
-            if let Some(p) = orders.get(&id) {
-                by_market.entry(p.market).or_default().push((id, p.block));
+            let Some(p) = orders.get(&id) else { continue };
+            let (first, attempts) = *tries.entry(id).or_insert((std::time::Instant::now(), 0));
+            if first.elapsed().as_secs() < attempt_due_secs(attempts) {
+                continue;
             }
+            tries.insert(id, (first, attempts + 1));
+            by_market.entry(p.market).or_default().push((id, p.block));
         }
         futures::future::join_all(by_market.into_iter().map(|(mid, list)| {
-            let (rpc, config, http) = (&rpc, &config, &http);
+            let (rpc, config, http, status) = (&rpc, &config, &http, &status);
             async move {
                 let Ok(m) = market(rpc, mid).await else { return };
                 if list.iter().any(|(_, req)| m.obs_block <= *req) {
-                    prime(rpc, config, http, &m).await;
+                    prime(rpc, config, http, status, &m).await;
                 }
                 for (id, _) in list {
                     match contract::execute_order(rpc, id).await {
@@ -223,44 +241,57 @@ async fn order_loop(rpc: Arc<NearRpc>, config: Config, http: reqwest::Client) {
             }
         }))
         .await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
+}
 
-        // ── conditionals: every third pass, only when the mark is at the trigger ──
-        if n % 3 == 0 {
-            let (ids, next) = pending_ids(&rpc, true, cond_floor).await;
-            cond_floor = ids.iter().copied().min().unwrap_or(next);
-            conds.retain(|id, _| ids.contains(id));
-            let mut marks: HashMap<u32, MarketInfo> = HashMap::new();
-            for id in ids {
-                if !conds.contains_key(&id) {
-                    if let Some(p) = pending_info(&rpc, true, id).await {
-                        conds.insert(id, p);
-                    }
-                }
-                let Some(p) = conds.get(&id).cloned() else { continue };
-                if !marks.contains_key(&p.market) {
-                    if let Ok(m) = market(&rpc, p.market).await {
-                        marks.insert(p.market, m);
-                    }
-                }
-                let Some(m) = marks.get(&p.market) else { continue };
-                if m.obs_block <= p.block || !near_trigger(&p, m.price) {
-                    continue;
-                }
-                match contract::execute_conditional(&rpc, id).await {
-                    Ok(hash) => info!(id, market = p.market, hash, "execute_conditional sent"),
-                    Err(e) => debug!(id, err = %e, "execute_conditional skipped"),
+/// Conditionals run in their own task: their id scan can be long (they rest
+/// for up to 30 days) and must not delay two-step orders, which expire in 30 s.
+async fn conditional_loop(rpc: Arc<NearRpc>) {
+    let mut cond_floor = 0u64;
+    let mut conds: HashMap<u64, Pending> = HashMap::new();
+    loop {
+        let (ids, next) = pending_ids(&rpc, true, cond_floor).await;
+        cond_floor = ids.iter().copied().min().unwrap_or(next);
+        conds.retain(|id, _| ids.contains(id));
+        let mut marks: HashMap<u32, MarketInfo> = HashMap::new();
+        for id in ids {
+            if !conds.contains_key(&id) {
+                if let Some(p) = pending_info(&rpc, true, id).await {
+                    conds.insert(id, p);
                 }
             }
+            let Some(p) = conds.get(&id).cloned() else { continue };
+            if !marks.contains_key(&p.market) {
+                if let Ok(m) = market(&rpc, p.market).await {
+                    marks.insert(p.market, m);
+                }
+            }
+            let Some(m) = marks.get(&p.market) else { continue };
+            // A zero mark means the view could not be read, not that price fell to zero.
+            if m.price == 0 || m.obs_block <= p.block || !near_trigger(&p, m.price) {
+                continue;
+            }
+            match contract::execute_conditional(&rpc, id).await {
+                Ok(hash) => info!(id, market = p.market, hash, "execute_conditional sent"),
+                Err(e) => debug!(id, err = %e, "execute_conditional skipped"),
+            }
         }
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(3000)).await;
     }
 }
 
 async fn liquidation_scan(rpc: &NearRpc, http: &reqwest::Client, indexer: &str) {
     let list: Vec<Value> = match http.get(format!("{}/accounts", indexer.trim_end_matches('/'))).send().await {
-        Ok(r) => r.json().await.unwrap_or_default(),
+        Ok(r) => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!(err = %e, "liquidation scan: bad account list from the indexer, nothing scanned");
+                return;
+            }
+        },
         Err(e) => {
-            debug!(err = %e, "indexer unreachable for liquidation scan");
+            error!(err = %e, "liquidation scan: indexer unreachable, nothing scanned");
             return;
         }
     };
@@ -287,14 +318,14 @@ async fn liquidation_scan(rpc: &NearRpc, http: &reqwest::Client, indexer: &str) 
 }
 
 /// One price pass over every market.
-async fn price_tick(rpc: &NearRpc, config: &Config, http: &reqwest::Client, ms: &[MarketInfo]) {
+async fn price_tick(rpc: &NearRpc, config: &Config, http: &reqwest::Client, status: &Status, ms: &[MarketInfo]) {
     // Markets are independent: update them concurrently so one slow tx does
     // not make every other market's price stale.
     futures::future::join_all(ms.iter().map(|m| async move {
         if m.mode == "WindDown" || m.mode == "Recovery" {
             return;
         }
-        let pushed = update_price(rpc, config, http, m).await;
+        let pushed = update_price(rpc, config, http, status, m).await;
         if m.mode == "Proposed" && m.seq > 0 {
             match rpc.call("activate_market", json!({ "market": m.id }), 0).await {
                 Ok(hash) => info!(market = m.id, hash, "activate_market sent"),
@@ -325,16 +356,19 @@ pub async fn run(config: Config) -> Result<()> {
     );
     let http = reqwest::Client::builder().timeout(Duration::from_secs(8)).build()?;
 
+    let status = Arc::new(Status::new());
+
     if let Some(addr) = config.faucet_addr.clone() {
-        let (rpc, cfg) = (rpc.clone(), config.clone());
+        let (rpc, cfg, status) = (rpc.clone(), config.clone(), status.clone());
         tokio::spawn(async move {
-            if let Err(e) = crate::faucet::serve(addr, rpc, cfg).await {
+            if let Err(e) = crate::faucet::serve(addr, rpc, cfg, status).await {
                 error!(err = %e, "faucet server stopped");
             }
         });
     }
 
-    tokio::spawn(order_loop(rpc.clone(), config.clone(), http.clone()));
+    tokio::spawn(order_loop(rpc.clone(), config.clone(), http.clone(), status.clone()));
+    tokio::spawn(conditional_loop(rpc.clone()));
 
     if let Some(indexer) = config.indexer_url.clone() {
         let (rpc, http) = (rpc.clone(), http.clone());
@@ -360,12 +394,75 @@ pub async fn run(config: Config) -> Result<()> {
         // The market list changes rarely: re-read it every fifth pass.
         if tick_count % 5 == 1 || cache.read().await.is_empty() {
             let ms = markets(&rpc, &config).await;
+            // Watchdog: transactions are sent with INCLUDED, so "sent" proves
+            // nothing. What counts is the observation advancing on chain.
+            let now = now_ms();
+            for m in &ms {
+                let stuck = status.observe(m.id, &m.symbol, &m.mode, m.seq, now);
+                if m.mode == "Active" && stuck > config.stale_alert_secs * 1000 {
+                    error!(market = m.id, symbol = %m.symbol, stuck_secs = stuck / 1000, "ALERT: observation is not advancing");
+                }
+            }
             if !ms.is_empty() {
                 *cache.write().await = ms;
             }
         }
+        if tick_count % 60 == 1 {
+            match rpc.signer_balance().await {
+                Ok(b) => {
+                    status.set_balance(b);
+                    if b < config.min_balance_yocto {
+                        warn!(signer = %config.signer_id, yocto = %b, "ALERT: signer balance is low, transactions will stop soon");
+                    }
+                }
+                Err(e) => warn!(err = %e, "could not read the signer balance"),
+            }
+        }
         let ms = cache.read().await.clone();
-        price_tick(&rpc, &config, &http, &ms).await;
+        price_tick(&rpc, &config, &http, &status, &ms).await;
         tokio::time::sleep(interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_back_off() {
+        let due: Vec<u64> = (0..5).map(attempt_due_secs).collect();
+        assert_eq!(due, vec![0, 2, 6, 14, 30]);
+        // Orders live about 30 s, so at most five sends instead of thirty.
+        assert!(attempt_due_secs(5) > 30);
+        assert!(attempt_due_secs(u32::MAX) > 30);
+    }
+
+    fn pending(kind: &str, long: bool, trigger: u64) -> Pending {
+        Pending { market: 0, block: 0, kind: kind.into(), long, trigger }
+    }
+
+    #[test]
+    fn trigger_rule_matches_the_contract_with_slack() {
+        let t = 1_000_000u64;
+        // (kind, order side long?, fires when the mark has risen to the trigger?)
+        for (kind, long, up) in [
+            ("TakeProfit", false, true),
+            ("StopLoss", true, true),
+            ("Limit", false, true),
+            ("TakeProfit", true, false),
+            ("StopLoss", false, false),
+            ("Limit", true, false),
+        ] {
+            let p = pending(kind, long, t);
+            if up {
+                assert!(near_trigger(&p, t), "{kind} {long}");
+                assert!(near_trigger(&p, 998_000), "{kind} {long}: inside the 0.3% slack");
+                assert!(!near_trigger(&p, 996_000), "{kind} {long}: outside the slack");
+            } else {
+                assert!(near_trigger(&p, t), "{kind} {long}");
+                assert!(near_trigger(&p, 1_002_000), "{kind} {long}: inside the 0.3% slack");
+                assert!(!near_trigger(&p, 1_004_000), "{kind} {long}: outside the slack");
+            }
+        }
     }
 }

@@ -28,13 +28,13 @@ pub async fn set_last_block(pool: &PgPool, block: u64) -> Result<()> {
 
 /// Process a single neap event and write it to the database.
 pub async fn process_event(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     ev: &NeapEvent,
     block: u64,
     ts: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     if let Some(m) = ev.data["market"].as_u64() {
-        ensure_market(pool, m as i32).await?;
+        ensure_market(&mut *conn, m as i32).await?;
     }
     match ev.event.as_str() {
         "market_created" => {
@@ -56,7 +56,7 @@ pub async fn process_event(
             .bind(tier)
             .bind(lister)
             .bind(bond)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
             info!(market = id, symbol, "market_created");
         }
@@ -64,7 +64,7 @@ pub async fn process_event(
             let id = ev.data["market"].as_u64().unwrap_or(0) as i32;
             sqlx::query("UPDATE markets SET mode = 'Active' WHERE id = $1")
                 .bind(id)
-                .execute(pool)
+                .execute(&mut *conn)
                 .await?;
             info!(market = id, "market_activated");
         }
@@ -74,7 +74,7 @@ pub async fn process_event(
             sqlx::query("UPDATE markets SET mode = $2 WHERE id = $1")
                 .bind(id)
                 .bind(mode)
-                .execute(pool)
+                .execute(&mut *conn)
                 .await?;
             info!(market = id, mode, "market_mode_changed");
         }
@@ -96,6 +96,10 @@ pub async fn process_event(
                 .as_str()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            if price_e6 <= 0 || seq <= 0 {
+                warn!(market = market_id, "price_observed without a usable price or seq, skipped");
+                return Ok(());
+            }
             sqlx::query(
                 "INSERT INTO observations (market_id, price_e6, ema_e6, liquidity, seq, block, ts)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -108,7 +112,7 @@ pub async fn process_event(
             .bind(seq)
             .bind(block as i64)
             .bind(ts)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         }
         "order_requested" => {
@@ -130,12 +134,13 @@ pub async fn process_event(
                  ON CONFLICT (id) DO NOTHING",
             )
             .bind(market_id)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
             sqlx::query(
                 "INSERT INTO orders (id, market_id, owner, side, size_q, limit_price, status, request_block, created_at, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $8)
-                 ON CONFLICT (id) DO NOTHING",
+                 ON CONFLICT (id) DO UPDATE SET market_id=$2, owner=$3, side=$4, size_q=$5,
+                     limit_price=$6, request_block=$7, created_at=$8",
             )
             .bind(id)
             .bind(market_id)
@@ -145,7 +150,7 @@ pub async fn process_event(
             .bind(limit_price)
             .bind(block as i64)
             .bind(ts)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         }
         "fill" => {
@@ -164,7 +169,7 @@ pub async fn process_event(
             let side: String = match order_id {
                 Some(oid) => sqlx::query_as::<_, (String,)>("SELECT side FROM orders WHERE id = $1")
                     .bind(oid)
-                    .fetch_optional(pool)
+                    .fetch_optional(&mut *conn)
                     .await?
                     .map(|(s,)| s)
                     .unwrap_or_default(),
@@ -184,25 +189,30 @@ pub async fn process_event(
             .bind(market_id)
             .bind(owner)
             .bind(order_id)
-            .bind(side)
+            .bind(&side)
             .bind(size_q)
             .bind(price)
             .bind(fee)
             .bind(block as i64)
             .bind(ts)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
             // Mark order as filled.
             if let Some(oid) = order_id {
                 sqlx::query(
-                    "UPDATE orders SET status='filled', fill_price=$2, fee=$3, updated_at=$4
-                     WHERE id=$1",
+                    "INSERT INTO orders (id, market_id, owner, side, size_q, status, fill_price, fee, created_at, updated_at)
+                     VALUES ($1, $5, $6, $7, $8, 'filled', $2, $3, $4, $4)
+                     ON CONFLICT (id) DO UPDATE SET status='filled', fill_price=$2, fee=$3, updated_at=$4",
                 )
                 .bind(oid)
                 .bind(price)
                 .bind(fee)
                 .bind(ts)
-                .execute(pool)
+                .bind(market_id)
+                .bind(owner)
+                .bind(&side)
+                .bind(size_q)
+                .execute(&mut *conn)
                 .await?;
             }
             info!(market = market_id, owner, price, "fill");
@@ -212,30 +222,14 @@ pub async fn process_event(
                 .as_str()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            for table in ["orders", "conditionals"] {
-                sqlx::query(&format!(
-                    "UPDATE {table} SET status='cancelled', updated_at=$2 WHERE id=$1"
-                ))
-                .bind(id)
-                .bind(ts)
-                .execute(pool)
-                .await?;
-            }
+            set_terminal(conn, id, ev.data["market"].as_u64(), "cancelled", ts).await?;
         }
         "order_expired" => {
             let id: i64 = ev.data["id"]
                 .as_str()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            for table in ["orders", "conditionals"] {
-                sqlx::query(&format!(
-                    "UPDATE {table} SET status='expired', updated_at=$2 WHERE id=$1"
-                ))
-                .bind(id)
-                .bind(ts)
-                .execute(pool)
-                .await?;
-            }
+            set_terminal(conn, id, ev.data["market"].as_u64(), "expired", ts).await?;
         }
         "conditional_placed" => {
             let id: i64 = ev.data["id"]
@@ -264,7 +258,7 @@ pub async fn process_event(
             .bind(size_q)
             .bind(trigger_price)
             .bind(ts)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         }
         "conditional_triggered" => {
@@ -282,8 +276,35 @@ pub async fn process_event(
             .bind(id)
             .bind(fill_price)
             .bind(ts)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
+            // The contract emits no separate `fill` for a triggered conditional:
+            // record it so trade history and 24h counts include TP/SL/limit fills.
+            if let (Some(market), Some(owner)) = (ev.data["market"].as_u64(), ev.data["owner"].as_str()) {
+                let size_q = ev.data["size_q"].as_str().unwrap_or("0");
+                let side: String = sqlx::query_as::<_, (String,)>("SELECT side FROM conditionals WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut *conn)
+                    .await?
+                    .map(|(s,)| s)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| if size_q.starts_with('-') { "Short".into() } else { "Long".into() });
+                sqlx::query(
+                    "INSERT INTO fills (market_id, owner, order_id, side, size_q, price, fee, block, ts)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                )
+                .bind(market as i32)
+                .bind(owner)
+                .bind(id)
+                .bind(side)
+                .bind(size_q)
+                .bind(fill_price)
+                .bind(ev.data["fee"].as_str().unwrap_or("0"))
+                .bind(block as i64)
+                .bind(ts)
+                .execute(&mut *conn)
+                .await?;
+            }
         }
         "liquidation" => {
             let market_id = ev.data["market"].as_u64().unwrap_or(0) as i32;
@@ -302,7 +323,7 @@ pub async fn process_event(
             .bind(fee)
             .bind(block as i64)
             .bind(ts)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
             info!(market = market_id, account, "liquidation");
         }
@@ -321,7 +342,7 @@ pub async fn process_event(
             .bind(amount)
             .bind(block as i64)
             .bind(ts)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         }
         other => {
@@ -332,9 +353,67 @@ pub async fn process_event(
     Ok(())
 }
 
+/// Mark an order or conditional as cancelled/expired. Ids are shared between
+/// the two tables. If neither row exists yet (the terminal event was indexed
+/// before the request, which happens because the block feed and `POST /tx`
+/// deliver independently), keep a stub order so the later request does not
+/// resurrect it as `pending`.
+async fn set_terminal(
+    conn: &mut sqlx::PgConnection,
+    id: i64,
+    market: Option<u64>,
+    status: &str,
+    ts: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let mut hit = 0;
+    for table in ["orders", "conditionals"] {
+        hit += sqlx::query(&format!("UPDATE {table} SET status=$3, updated_at=$2 WHERE id=$1"))
+            .bind(id)
+            .bind(ts)
+            .bind(status)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+    }
+    if let (0, Some(m)) = (hit, market) {
+        sqlx::query(
+            "INSERT INTO orders (id, market_id, owner, side, size_q, status, created_at, updated_at)
+             VALUES ($1, $2, '', '', '0', $3, $4, $4) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(m as i32)
+        .bind(status)
+        .bind(ts)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Write one receipt's events in a single transaction together with its
+/// `seen_receipts` row, so a receipt is either fully indexed or not at all
+/// (and can be retried). Returns false when it was already indexed.
+pub async fn index_receipt(
+    pool: &PgPool,
+    receipt_id: &str,
+    events: &[&NeapEvent],
+    block: u64,
+    ts: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    let mut txn = pool.begin().await?;
+    if !mark_receipt(&mut *txn, receipt_id).await? {
+        return Ok(false);
+    }
+    for ev in events {
+        process_event(&mut txn, ev, block, ts).await?;
+    }
+    txn.commit().await?;
+    Ok(true)
+}
+
 /// Insert a placeholder market row so FK inserts never fail when the indexer
 /// starts after `market_created`. The chain poller fills in the real fields.
-pub async fn ensure_market(pool: &PgPool, id: i32) -> Result<()> {
+pub async fn ensure_market<'e>(pool: impl sqlx::PgExecutor<'e>, id: i32) -> Result<()> {
     sqlx::query(
         "INSERT INTO markets (id, symbol, tier, mode, lister) VALUES ($1, '', '', 'Active', '')
          ON CONFLICT (id) DO NOTHING",
@@ -383,7 +462,7 @@ pub async fn get_state(pool: &PgPool, key: &str) -> Result<Option<String>> {
 /// Drop every indexed row and remember which contract the tables now belong to.
 pub async fn reset_for_contract(pool: &PgPool, contract: &str) -> Result<()> {
     sqlx::raw_sql(
-        "TRUNCATE observations, candles, orders, conditionals, fills, liquidations, fee_claims, markets, indexer_state, seen_receipts",
+        "TRUNCATE observations, candles, orders, conditionals, fills, liquidations, fee_claims, markets, indexer_state, seen_receipts, skipped_ranges",
     )
     .execute(pool)
     .await?;
@@ -424,10 +503,125 @@ pub async fn upsert_observation_from_view(pool: &PgPool, id: i32, v: &serde_json
 
 /// Remember a receipt. Returns false when it was already indexed (the block
 /// feed and the per-transaction path can both deliver the same receipt).
-pub async fn mark_receipt(pool: &PgPool, receipt_id: &str) -> Result<bool> {
+pub async fn mark_receipt<'e>(pool: impl sqlx::PgExecutor<'e>, receipt_id: &str) -> Result<bool> {
     let r = sqlx::query("INSERT INTO seen_receipts (receipt_id) VALUES ($1) ON CONFLICT DO NOTHING")
         .bind(receipt_id)
         .execute(pool)
         .await?;
     Ok(r.rows_affected() == 1)
+}
+
+/// Remember a block range the fetcher gave up on, so it can be backfilled.
+pub async fn record_skipped(pool: &PgPool, from_block: u64, to_block: u64) -> Result<()> {
+    sqlx::query("INSERT INTO skipped_ranges (from_block, to_block) VALUES ($1, $2)")
+        .bind(from_block as i64)
+        .bind(to_block as i64)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Database scenarios. They need a Postgres to write to and are skipped
+/// unless `TEST_DATABASE_URL` is set (CI sets it; see .github/workflows).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ev(event: &str, data: serde_json::Value) -> NeapEvent {
+        NeapEvent { event: event.to_string(), data }
+    }
+
+    async fn status(pool: &PgPool, table: &str, id: i64) -> Option<String> {
+        sqlx::query_as::<_, (String,)>(&format!("SELECT status FROM {table} WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+            .map(|(s,)| s)
+    }
+
+    async fn count(pool: &PgPool, sql: &str) -> i64 {
+        sqlx::query_as::<_, (i64,)>(sql).fetch_one(pool).await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn receipts_are_atomic_and_order_independent() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("TEST_DATABASE_URL not set, skipping database scenarios");
+            return;
+        };
+        let pool = PgPool::connect(&url).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/001_init.sql")).execute(&pool).await.unwrap();
+        reset_for_contract(&pool, "test.testnet").await.unwrap();
+        let ts = chrono::Utc::now();
+
+        let request = ev("order_requested", json!({
+            "id": "7", "market": 0, "owner": "alice.testnet", "side": "Long",
+            "size_q": "1000", "limit_price": "5000000",
+        }));
+        let fill = ev("fill", json!({
+            "market": 0, "owner": "alice.testnet", "order_id": "7",
+            "size_q": "1000", "price": "5010000", "fee": "25",
+        }));
+
+        // 1. The keeper's fill is indexed before the user's request (the two
+        //    delivery paths are independent). The order must end up filled.
+        assert!(index_receipt(&pool, "r-fill", &[&fill], 10, ts).await.unwrap());
+        assert!(index_receipt(&pool, "r-request", &[&request], 9, ts).await.unwrap());
+        assert_eq!(status(&pool, "orders", 7).await.as_deref(), Some("filled"));
+        let owner: (String, String) = sqlx::query_as("SELECT owner, side FROM orders WHERE id = 7")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(owner, ("alice.testnet".to_string(), "Long".to_string()));
+
+        // 2. The same receipt from the other path is ignored: one fill, not two.
+        assert!(!index_receipt(&pool, "r-fill", &[&fill], 10, ts).await.unwrap());
+        assert_eq!(count(&pool, "SELECT count(*) FROM fills WHERE order_id = 7").await, 1);
+
+        // 3. A cancel that arrives before its request keeps the order cancelled.
+        let cancel = ev("order_cancelled", json!({ "id": "8", "market": 0 }));
+        let request8 = ev("order_requested", json!({
+            "id": "8", "market": 0, "owner": "bob.testnet", "side": "Short",
+            "size_q": "5", "limit_price": "1",
+        }));
+        index_receipt(&pool, "r-cancel", &[&cancel], 11, ts).await.unwrap();
+        index_receipt(&pool, "r-request8", &[&request8], 10, ts).await.unwrap();
+        assert_eq!(status(&pool, "orders", 8).await.as_deref(), Some("cancelled"));
+
+        // 4. A receipt whose second event cannot be written leaves nothing
+        //    behind, not even the seen_receipts row, so it can be retried.
+        let good = ev("order_requested", json!({
+            "id": "9", "market": 0, "owner": "carol.testnet", "side": "Long",
+            "size_q": "1", "limit_price": "1",
+        }));
+        // Postgres refuses a NUL byte in text: this insert fails in the database.
+        let poison = ev("liquidation", json!({ "market": 0, "account": "x\u{0}", "caller": "y" }));
+        assert!(index_receipt(&pool, "r-poison", &[&good, &poison], 12, ts).await.is_err());
+        assert_eq!(status(&pool, "orders", 9).await, None);
+        assert_eq!(count(&pool, "SELECT count(*) FROM seen_receipts WHERE receipt_id = 'r-poison'").await, 0);
+        assert!(index_receipt(&pool, "r-poison", &[&good], 12, ts).await.unwrap(), "retry succeeds");
+
+        // 5. A triggered conditional shows up in trade history.
+        let placed = ev("conditional_placed", json!({
+            "id": "20", "market": 0, "owner": "alice.testnet", "kind": "TakeProfit",
+            "side": "Short", "size_q": "1000", "trigger_price": "6000000",
+        }));
+        let triggered = ev("conditional_triggered", json!({
+            "id": "20", "market": 0, "owner": "alice.testnet", "kind": "TakeProfit",
+            "fill_price": "6000100", "size_q": "1000", "fee": "30",
+        }));
+        index_receipt(&pool, "r-placed", &[&placed], 13, ts).await.unwrap();
+        index_receipt(&pool, "r-trig", &[&triggered], 14, ts).await.unwrap();
+        assert_eq!(status(&pool, "conditionals", 20).await.as_deref(), Some("triggered"));
+        let f: (String, i64) = sqlx::query_as("SELECT side, price FROM fills WHERE order_id = 20")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(f, ("Short".to_string(), 6_000_100));
+
+        // 6. The candle query's time bound is valid SQL and returns the bucket.
+        sqlx::query("INSERT INTO observations (market_id, price_e6, seq, block, ts) VALUES (0, 5000000, 1, 1, now())")
+            .execute(&pool).await.unwrap();
+        let n = count(&pool,
+            "SELECT count(*) FROM observations WHERE market_id = 0 AND ts >= now() - make_interval(secs => 60::float8 * (300::bigint + 1))").await;
+        assert_eq!(n, 1);
+    }
 }

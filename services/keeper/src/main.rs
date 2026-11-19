@@ -22,6 +22,7 @@ mod faucet;
 mod keeper;
 mod price;
 mod rpc;
+mod status;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;

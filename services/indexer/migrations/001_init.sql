@@ -111,3 +111,21 @@ CREATE TABLE IF NOT EXISTS seen_receipts (
     receipt_id TEXT PRIMARY KEY,
     seen_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Block ranges the fetcher skipped (rate limits, long downtime). Events in
+-- them are missing until a backfill reads these rows.
+CREATE TABLE IF NOT EXISTS skipped_ranges (
+    id         BIGSERIAL PRIMARY KEY,
+    from_block BIGINT NOT NULL,
+    to_block   BIGINT NOT NULL,
+    at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Indexes for the queries the API actually runs.
+CREATE INDEX IF NOT EXISTS idx_obs_market_ts ON observations(market_id, ts);
+CREATE INDEX IF NOT EXISTS idx_fills_market_ts ON fills(market_id, ts);
+CREATE INDEX IF NOT EXISTS idx_orders_owner ON orders(owner);
+CREATE INDEX IF NOT EXISTS idx_cond_owner ON conditionals(owner);
+CREATE INDEX IF NOT EXISTS idx_cond_market_status ON conditionals(market_id, status);
+CREATE INDEX IF NOT EXISTS idx_liq_market ON liquidations(market_id, block);
+CREATE INDEX IF NOT EXISTS idx_liq_account ON liquidations(account);

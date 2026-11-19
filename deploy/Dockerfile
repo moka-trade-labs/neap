@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/neap-indexer /usr/local/bin/neap-keeper /usr/local/bin/
 COPY deploy/start.sh /usr/local/bin/start.sh
-RUN chmod +x /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/start.sh && useradd --system --no-create-home --uid 10001 neap
+# The services hold a signing key: do not run them as root.
+USER neap
 ENV RUST_LOG=info PORT=10000
 EXPOSE 10000
 ENTRYPOINT ["/usr/bin/tini", "--"]

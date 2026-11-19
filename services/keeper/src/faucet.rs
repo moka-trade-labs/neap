@@ -6,15 +6,16 @@
 
 use crate::config::Config;
 use crate::rpc::NearRpc;
+use crate::status::Status;
 use anyhow::Result;
-use axum::{extract::State, http::{HeaderMap, StatusCode}, response::IntoResponse, routing::post, Json, Router};
+use axum::{extract::State, http::{HeaderMap, StatusCode}, response::IntoResponse, routing::{get, post}, Json, Router};
 use near_primitives::types::AccountId;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 const WINDOW: Duration = Duration::from_secs(3600);
 const PER_IP: usize = 5;
@@ -26,16 +27,22 @@ struct Faucet {
     by_ip: Mutex<HashMap<String, Vec<Instant>>>,
 }
 
-pub async fn serve(addr: String, rpc: Arc<NearRpc>, cfg: Config) -> Result<()> {
+pub async fn serve(addr: String, rpc: Arc<NearRpc>, cfg: Config, status: Arc<Status>) -> Result<()> {
+    // The faucet signs with the oracle key: it only exists on testnet.
+    let faucet_on = cfg.contract_id.ends_with(".testnet");
     let state = Arc::new(Faucet {
         rpc,
         cfg,
         by_account: Mutex::new(HashMap::new()),
         by_ip: Mutex::new(HashMap::new()),
     });
-    let app = Router::new().route("/faucet", post(drip)).with_state(state);
+    let mut app = Router::new().route("/status", get(move || { let s = status.clone(); async move { Json(s.json()) } }));
+    if faucet_on {
+        app = app.route("/faucet", post(drip));
+    }
+    let app = app.with_state(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!(addr, "faucet listening");
+    info!(addr, faucet = faucet_on, "internal server listening (/status, /faucet)");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -53,33 +60,54 @@ async fn drip(State(f): State<Arc<Faucet>>, headers: HeaderMap, Json(body): Json
     };
     let ip = headers.get("x-client-ip").and_then(|h| h.to_str().ok()).unwrap_or("unknown").to_string();
 
-    // Rate limits.
+    // Rate limits. The slot is taken here, before any transaction is sent, so
+    // parallel requests cannot all pass the check; it is given back on failure.
+    let reserved = Instant::now();
     {
-        let now = Instant::now();
-        let by_acc = f.by_account.lock().await;
-        if let Some(t) = by_acc.get(&account) {
-            if now.duration_since(*t) < WINDOW {
-                let wait = WINDOW - now.duration_since(*t);
-                return bad(StatusCode::TOO_MANY_REQUESTS, format!("already funded; try again in {} min", wait.as_secs() / 60 + 1));
-            }
-        }
+        let now = reserved;
+        let mut by_acc = f.by_account.lock().await;
         let mut by_ip = f.by_ip.lock().await;
-        let v = by_ip.entry(ip.clone()).or_default();
-        v.retain(|t| now.duration_since(*t) < WINDOW);
-        if v.len() >= PER_IP {
+        by_acc.retain(|_, t| now.duration_since(*t) < WINDOW);
+        by_ip.retain(|_, v| {
+            v.retain(|t| now.duration_since(*t) < WINDOW);
+            !v.is_empty()
+        });
+        if let Some(t) = by_acc.get(&account) {
+            let wait = WINDOW - now.duration_since(*t);
+            return bad(StatusCode::TOO_MANY_REQUESTS, format!("already funded; try again in {} min", wait.as_secs() / 60 + 1));
+        }
+        if by_ip.get(&ip).map(|v| v.len()).unwrap_or(0) >= PER_IP {
             return bad(StatusCode::TOO_MANY_REQUESTS, "too many faucet requests from this IP; try later");
         }
+        by_acc.insert(account.clone(), now);
+        by_ip.entry(ip.clone()).or_default().push(now);
     }
+    let release = || async {
+        f.by_account.lock().await.remove(&account);
+        if let Some(v) = f.by_ip.lock().await.get_mut(&ip) {
+            v.retain(|t| *t != reserved);
+        }
+    };
 
     match f.rpc.account_exists(&account).await {
         Ok(true) => {}
-        Ok(false) => return bad(StatusCode::BAD_REQUEST, "account does not exist on chain yet; create it in your wallet first"),
-        Err(e) => return bad(StatusCode::BAD_GATEWAY, e),
+        Ok(false) => {
+            release().await;
+            return bad(StatusCode::BAD_REQUEST, "account does not exist on chain yet; create it in your wallet first");
+        }
+        Err(e) => {
+            release().await;
+            warn!(account, err = %e, "faucet: account lookup failed");
+            return bad(StatusCode::BAD_GATEWAY, "could not reach the network, try again later");
+        }
     }
 
     let token: AccountId = match f.cfg.faucet_token.parse() {
         Ok(t) => t,
-        Err(_) => return bad(StatusCode::INTERNAL_SERVER_ERROR, "bad FAUCET_TOKEN"),
+        Err(_) => {
+            release().await;
+            return bad(StatusCode::INTERNAL_SERVER_ERROR, "faucet misconfigured");
+        }
     };
     let calls = vec![
         (
@@ -95,7 +123,12 @@ async fn drip(State(f): State<Arc<Faucet>>, headers: HeaderMap, Json(body): Json
     ];
     let usdc_tx = match f.rpc.call_many(&token, calls, 30_000_000_000_000).await {
         Ok(h) => h,
-        Err(e) => return bad(StatusCode::BAD_GATEWAY, format!("mint failed: {e}")),
+        Err(e) => {
+            release().await;
+            // RPC error text can carry provider URLs: log it, don't return it.
+            warn!(account, err = %e, "faucet: mint failed");
+            return bad(StatusCode::BAD_GATEWAY, "mint failed, try again later");
+        }
     };
 
     let mut near_tx = None;
@@ -108,11 +141,6 @@ async fn drip(State(f): State<Arc<Faucet>>, headers: HeaderMap, Json(body): Json
         }
     }
 
-    {
-        let now = Instant::now();
-        f.by_account.lock().await.insert(account.clone(), now);
-        f.by_ip.lock().await.entry(ip).or_default().push(now);
-    }
     info!(account, usdc_tx, "faucet drip");
     Json(json!({
         "ok": true,
